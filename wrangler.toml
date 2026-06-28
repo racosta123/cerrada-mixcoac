@@ -1,0 +1,10 @@
+name = "mixcoac-proxy"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+ALLOWED_ORIGIN = "https://racosta123.github.io"
+
+# Secrets (NO van aquí, se cargan con: wrangler secret put NOMBRE):
+#   SHELLY_HOST  SHELLY_AUTH_KEY  FIREBASE_PROJECT
+#   SA_EMAIL  SA_PRIVATE_KEY  QR_SECRET  READER_KEY  READER_SYNC_URL

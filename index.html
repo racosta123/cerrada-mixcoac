@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0d0d0f">
+<title>Cerrada Mixcoac</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+  :root{
+    --bg:#0d0d0f; --surface:#18181b; --surface-2:#1f1f23; --line:#2a2a30;
+    --gold:#d4af37; --gold-soft:#e8c468; --gold-dim:rgba(212,175,55,.12);
+    --text:#f5f5f4; --muted:#a1a1aa; --muted-2:#71717a;
+    --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+    --r:22px; --r-sm:14px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    background:
+      radial-gradient(1200px 600px at 50% -10%, rgba(212,175,55,.07), transparent 60%),
+      var(--bg);
+    color:var(--text);
+    min-height:100dvh;
+    -webkit-font-smoothing:antialiased;
+  }
+  .hidden{display:none!important}
+  button{font-family:inherit;cursor:pointer;border:none}
+  input,select{font-family:inherit}
+
+  /* ---------- LOGIN ---------- */
+  .login-wrap{
+    min-height:100dvh;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;padding:28px;
+  }
+  .brand{display:flex;flex-direction:column;align-items:center;gap:14px;margin-bottom:34px}
+  .brand .seal{
+    width:84px;height:84px;border-radius:26px;
+    background:linear-gradient(145deg,var(--gold),#9c7d1e);
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 14px 40px -10px rgba(212,175,55,.5);
+  }
+  .brand .seal svg{width:42px;height:42px}
+  .brand h1{margin:0;font-size:23px;font-weight:600;letter-spacing:.3px}
+  .brand p{margin:0;color:var(--muted);font-size:13px;letter-spacing:.4px}
+  .card{
+    width:100%;max-width:380px;background:var(--surface);
+    border:1px solid var(--line);border-radius:var(--r);
+    padding:26px 22px;box-shadow:0 24px 60px -24px rgba(0,0,0,.7);
+  }
+  .field{margin-bottom:14px}
+  .field label{display:block;font-size:12px;color:var(--muted);margin:0 0 7px 4px;letter-spacing:.3px}
+  .field input{
+    width:100%;padding:14px 16px;border-radius:var(--r-sm);
+    background:var(--surface-2);border:1px solid var(--line);
+    color:var(--text);font-size:15px;outline:none;transition:border .15s;
+  }
+  .field input:focus{border-color:var(--gold)}
+  .btn-primary{
+    width:100%;padding:15px;border-radius:var(--r-sm);margin-top:6px;
+    background:linear-gradient(145deg,var(--gold),#b8941f);color:#1a1300;
+    font-size:15px;font-weight:600;letter-spacing:.3px;
+    transition:transform .1s,filter .15s;
+  }
+  .btn-primary:active{transform:scale(.985)}
+  .btn-primary:disabled{filter:grayscale(.6) brightness(.7);cursor:default}
+  .err{color:var(--bad);font-size:13px;margin-top:12px;text-align:center;min-height:18px}
+
+  /* ---------- APP SHELL ---------- */
+  .app{max-width:560px;margin:0 auto;padding:0 16px 110px;min-height:100dvh}
+  .topbar{
+    position:sticky;top:0;z-index:30;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:16px 4px 14px;background:linear-gradient(var(--bg) 70%,transparent);
+  }
+  .topbar .who{display:flex;align-items:center;gap:11px}
+  .topbar .av{
+    width:42px;height:42px;border-radius:14px;flex-shrink:0;
+    background:linear-gradient(145deg,var(--gold),#9c7d1e);
+    display:flex;align-items:center;justify-content:center;
+    color:#1a1300;font-weight:700;font-size:16px;
+  }
+  .topbar .name{font-size:15px;font-weight:600;line-height:1.2}
+  .topbar .role{font-size:11px;color:var(--gold-soft);letter-spacing:.5px;text-transform:uppercase}
+  .icon-btn{
+    width:40px;height:40px;border-radius:13px;background:var(--surface);
+    border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--muted);
+  }
+  .icon-btn svg{width:20px;height:20px}
+
+  .section-title{font-size:13px;color:var(--muted);letter-spacing:.5px;margin:22px 4px 12px;text-transform:uppercase}
+
+  /* ---------- DOORS ---------- */
+  .doors{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+  .door{
+    position:relative;background:var(--surface);border:1px solid var(--line);
+    border-radius:var(--r);padding:18px 16px 16px;overflow:hidden;
+    transition:transform .12s,border-color .2s;
+  }
+  .door:active{transform:scale(.97)}
+  .door .ic{
+    width:46px;height:46px;border-radius:14px;background:var(--gold-dim);
+    display:flex;align-items:center;justify-content:center;margin-bottom:14px;
+  }
+  .door .ic svg{width:24px;height:24px;color:var(--gold-soft)}
+  .door .dn{font-size:15px;font-weight:600}
+  .door .ds{font-size:12px;color:var(--muted-2);margin-top:2px}
+  .door .pulse{
+    position:absolute;inset:0;border-radius:var(--r);
+    background:radial-gradient(circle at 30% 30%,rgba(52,211,153,.18),transparent 60%);
+    opacity:0;transition:opacity .25s;pointer-events:none;
+  }
+  .door.opening .pulse{opacity:1}
+  .door.opening{border-color:var(--ok)}
+
+  /* ---------- LIST CARDS ---------- */
+  .list{display:flex;flex-direction:column;gap:10px}
+  .row{
+    display:flex;align-items:center;gap:13px;background:var(--surface);
+    border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 15px;
+  }
+  .row .ri{
+    width:38px;height:38px;border-radius:11px;background:var(--surface-2);
+    display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--gold-soft);
+  }
+  .row .ri svg{width:18px;height:18px}
+  .row .rt{flex:1;min-width:0}
+  .row .rt .a{font-size:14px;font-weight:500}
+  .row .rt .b{font-size:12px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .tag{font-size:11px;padding:4px 9px;border-radius:8px;background:var(--gold-dim);color:var(--gold-soft);white-space:nowrap}
+  .row .tag.in{background:rgba(52,211,153,.13);color:var(--ok)}
+  .row .tag.out{background:rgba(248,113,113,.12);color:var(--bad)}
+
+  .empty{text-align:center;color:var(--muted-2);font-size:14px;padding:36px 10px}
+
+  /* ---------- FINANZAS ---------- */
+  .fin-cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;margin-bottom:14px}
+  .fin-card{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:15px 12px 14px;overflow:hidden}
+  .fin-bar{position:absolute;left:0;top:0;bottom:0;width:4px}
+  .fin-label{font-size:11px;color:var(--muted);letter-spacing:.3px;margin-bottom:7px}
+  .fin-val{font-size:17px;font-weight:700;letter-spacing:.2px}
+  .fin-val.ok{color:var(--ok)} .fin-val.bad{color:var(--bad)}
+  .fin-actions{display:flex;gap:10px;margin-bottom:6px}
+  .fin-actions .btn-primary{margin-top:0;flex:1}
+  .btn-ghost{flex:1;padding:15px;border-radius:var(--r-sm);background:var(--surface);border:1px solid var(--line);color:var(--gold-soft);font-size:14px;font-weight:600}
+  .btn-ghost:active{transform:scale(.985)}
+  .mov-amt{font-size:14px;font-weight:700;white-space:nowrap}
+  .mov-amt.ok{color:var(--ok)} .mov-amt.bad{color:var(--bad)}
+
+  /* ---------- TAB BAR ---------- */
+  .tabbar{
+    position:fixed;left:0;right:0;bottom:0;z-index:40;
+    display:flex;justify-content:space-around;
+    padding:10px 8px calc(10px + env(safe-area-inset-bottom));
+    background:rgba(20,20,23,.86);backdrop-filter:blur(16px);
+    border-top:1px solid var(--line);
+  }
+  .tab{
+    display:flex;flex-direction:column;align-items:center;gap:4px;
+    background:none;color:var(--muted-2);font-size:10px;letter-spacing:.3px;padding:4px 14px;
+  }
+  .tab svg{width:23px;height:23px}
+  .tab.active{color:var(--gold-soft)}
+
+  /* ---------- MODAL / SHEET ---------- */
+  .overlay{
+    position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.6);
+    display:flex;align-items:flex-end;justify-content:center;
+    opacity:0;pointer-events:none;transition:opacity .2s;
+  }
+  .overlay.open{opacity:1;pointer-events:auto}
+  .sheet{
+    width:100%;max-width:560px;background:var(--surface);
+    border-radius:26px 26px 0 0;border:1px solid var(--line);border-bottom:none;
+    padding:20px 20px calc(24px + env(safe-area-inset-bottom));
+    transform:translateY(100%);transition:transform .26s cubic-bezier(.2,.8,.2,1);
+    max-height:88dvh;overflow-y:auto;
+  }
+  .overlay.open .sheet{transform:translateY(0)}
+  .sheet h3{margin:4px 0 18px;font-size:18px;font-weight:600}
+  .grab{width:42px;height:4px;border-radius:3px;background:var(--line);margin:0 auto 16px}
+  .seg{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+  .seg button{
+    flex:1;min-width:64px;padding:11px;border-radius:12px;
+    background:var(--surface-2);border:1px solid var(--line);
+    color:var(--muted);font-size:13px;font-weight:500;
+  }
+  .seg button.sel{background:var(--gold-dim);border-color:var(--gold);color:var(--gold-soft)}
+  .qr-box{
+    background:#fff;border-radius:var(--r-sm);padding:18px;
+    display:flex;align-items:center;justify-content:center;margin:6px auto 16px;width:230px;height:230px;
+  }
+  .qr-box img{width:100%;height:100%;image-rendering:pixelated}
+  .qr-meta{text-align:center;color:var(--muted);font-size:13px;margin-bottom:6px}
+  .qr-count{text-align:center;color:var(--gold-soft);font-size:12px;margin-bottom:14px}
+
+  /* ---------- TOAST ---------- */
+  .toast{
+    position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(20px);
+    z-index:60;background:#26262b;border:1px solid var(--line);
+    padding:12px 18px;border-radius:14px;font-size:14px;
+    opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:90%;
+    box-shadow:0 16px 40px -12px rgba(0,0,0,.7);
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.ok{border-color:var(--ok)}
+  .toast.bad{border-color:var(--bad)}
+
+  .spinner{width:18px;height:18px;border:2.5px solid rgba(26,19,0,.3);border-top-color:#1a1300;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:-3px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<!-- ============ LOGIN ============ -->
+<div id="loginView" class="login-wrap">
+  <div class="brand">
+    <div class="seal">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#1a1300" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>
+      </svg>
+    </div>
+    <h1>Cerrada Mixcoac</h1>
+    <p>Control de acceso residencial</p>
+  </div>
+  <div class="card">
+    <div class="field">
+      <label>Correo</label>
+      <input id="email" type="email" autocomplete="username" placeholder="tu@correo.com">
+    </div>
+    <div class="field">
+      <label>Contraseña</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
+    </div>
+    <button id="loginBtn" class="btn-primary">Entrar</button>
+    <div id="loginErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ APP ============ -->
+<div id="appView" class="app hidden">
+  <div class="topbar">
+    <div class="who">
+      <div class="av" id="avatar">·</div>
+      <div>
+        <div class="name" id="userName">—</div>
+        <div class="role" id="userRole">—</div>
+      </div>
+    </div>
+    <button class="icon-btn" id="logoutBtn" title="Salir">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- TAB: PUERTAS -->
+  <div id="tab-doors" class="tabpane">
+    <div class="section-title">Abrir puertas</div>
+    <div class="doors" id="doorsGrid"></div>
+  </div>
+
+  <!-- TAB: INVITADOS -->
+  <div id="tab-invites" class="tabpane hidden">
+    <div class="section-title">Generar invitación</div>
+    <div class="list">
+      <button class="btn-primary" id="newInviteBtn" style="margin-top:0">Nueva invitación de visita</button>
+    </div>
+    <div class="section-title">Invitaciones activas</div>
+    <div class="list" id="invitesList"><div class="empty">Sin invitaciones activas</div></div>
+  </div>
+
+  <!-- TAB: BITÁCORA -->
+  <div id="tab-log" class="tabpane hidden">
+    <div class="section-title" id="logTitle">Mi historial</div>
+    <div class="list" id="logList"><div class="empty">Sin movimientos</div></div>
+  </div>
+
+  <!-- TAB: FINANZAS -->
+  <div id="tab-finanzas" class="tabpane hidden">
+    <div class="section-title" id="finMonth">Finanzas</div>
+    <div class="fin-cards">
+      <div class="fin-card">
+        <div class="fin-bar" style="background:var(--ok)"></div>
+        <div class="fin-label">Cobrado</div>
+        <div class="fin-val ok" id="finCobrado">$0</div>
+      </div>
+      <div class="fin-card">
+        <div class="fin-bar" style="background:var(--bad)"></div>
+        <div class="fin-label">Gastos</div>
+        <div class="fin-val bad" id="finGastos">$0</div>
+      </div>
+      <div class="fin-card">
+        <div class="fin-bar" style="background:var(--gold)"></div>
+        <div class="fin-label">En caja</div>
+        <div class="fin-val" id="finCaja">$0</div>
+      </div>
+    </div>
+    <div class="fin-actions">
+      <button class="btn-primary" id="newMovBtn" style="margin-top:0">Registrar movimiento</button>
+      <button class="btn-ghost" id="pdfBtn">Reporte PDF</button>
+    </div>
+    <div class="section-title">Movimientos del mes</div>
+    <div class="list" id="movList"><div class="empty">Sin movimientos</div></div>
+  </div>
+
+  <!-- TAB: ADMIN (master/admin) -->
+  <div id="tab-admin" class="tabpane hidden">
+    <div class="section-title">Gestión</div>
+    <div class="list">
+      <button class="btn-primary" id="newUserBtn" style="margin-top:0">Crear usuario</button>
+    </div>
+    <div class="section-title">Usuarios</div>
+    <div class="list" id="usersList"><div class="empty">Cargando…</div></div>
+  </div>
+
+  <!-- TAB BAR -->
+  <div class="tabbar" id="tabbar"></div>
+</div>
+
+<!-- ============ INVITE SHEET ============ -->
+<div class="overlay" id="inviteOverlay">
+  <div class="sheet" id="inviteSheet">
+    <div class="grab"></div>
+    <h3>Nueva invitación de visita</h3>
+    <div id="inviteForm">
+      <div class="field"><label>Nombre del visitante</label><input id="visitorName" placeholder="Ej. Juan Pérez"></div>
+      <label style="display:block;font-size:12px;color:var(--muted);margin:0 0 7px 4px">Duración</label>
+      <div class="seg" id="durSeg">
+        <button data-h="1">1 h</button><button data-h="2">2 h</button>
+        <button data-h="4" class="sel">4 h</button><button data-h="24">24 h</button>
+      </div>
+      <label style="display:block;font-size:12px;color:var(--muted);margin:0 0 7px 4px">Usos permitidos</label>
+      <div class="seg" id="usesSeg">
+        <button data-u="1" class="sel">1 uso</button><button data-u="4">4 usos</button>
+        <button data-u="0">Ilimitado</button>
+      </div>
+      <button class="btn-primary" id="genInviteBtn">Generar código QR</button>
+    </div>
+    <div id="inviteResult" class="hidden">
+      <div class="qr-box"><img id="qrImg" alt="QR de acceso"></div>
+      <div class="qr-meta" id="qrMeta"></div>
+      <div class="qr-count" id="qrCount"></div>
+      <button class="btn-primary" id="shareQrBtn">Compartir código</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ NEW USER SHEET ============ -->
+<div class="overlay" id="userOverlay">
+  <div class="sheet" id="userSheet">
+    <div class="grab"></div>
+    <h3>Crear usuario</h3>
+    <div class="field"><label>Nombre completo</label><input id="nuName" placeholder="Nombre"></div>
+    <div class="field"><label>Correo</label><input id="nuEmail" type="email" placeholder="correo@correo.com"></div>
+    <div class="field"><label>Contraseña temporal</label><input id="nuPass" placeholder="mínimo 8 caracteres"></div>
+    <label style="display:block;font-size:12px;color:var(--muted);margin:0 0 7px 4px">Rol</label>
+    <div class="seg" id="roleSeg">
+      <button data-r="residente" class="sel">Residente</button>
+      <button data-r="admin">Administrador</button>
+    </div>
+    <div class="field" id="casaField"><label>Casa / Lote</label><input id="nuCasa" placeholder="Ej. Casa 14"></div>
+    <button class="btn-primary" id="createUserBtn">Crear usuario</button>
+    <div id="nuErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ NEW MOVEMENT SHEET ============ -->
+<div class="overlay" id="movOverlay">
+  <div class="sheet" id="movSheet">
+    <div class="grab"></div>
+    <h3>Registrar movimiento</h3>
+    <div class="seg" id="movTypeSeg">
+      <button data-t="ingreso" class="sel">Ingreso (cobro)</button>
+      <button data-t="egreso">Gasto</button>
+    </div>
+    <div class="field"><label>Concepto</label><input id="movConcept" placeholder="Ej. Cuota mensual Casa 14"></div>
+    <div class="field"><label>Categoría</label>
+      <input id="movCat" list="catList" placeholder="Mantenimiento, Cuota, Servicio…">
+      <datalist id="catList">
+        <option value="Cuota"><option value="Mantenimiento"><option value="Servicios">
+        <option value="Seguridad"><option value="Limpieza"><option value="Mejoras"><option value="Otro">
+      </datalist>
+    </div>
+    <div class="field"><label>Monto (MXN)</label><input id="movAmount" type="number" inputmode="decimal" placeholder="0.00"></div>
+    <button class="btn-primary" id="saveMovBtn">Guardar movimiento</button>
+    <div id="movErr" class="err"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- ====== Firebase (compat) + QR lib ====== -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-check-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

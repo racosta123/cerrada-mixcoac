@@ -1,0 +1,52 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function rol() {
+      return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.rol;
+    }
+    function staff() { return rol() in ['master','admin']; }
+    function signedIn() { return request.auth != null; }
+
+    // ---- usuarios ----
+    match /usuarios/{uid} {
+      // cada quien lee su perfil; staff lee todos
+      allow read: if signedIn() && (request.auth.uid == uid || staff());
+      // el alta la hace el Worker (Admin SDK). El cliente solo actualiza su fcmToken.
+      allow create: if false;
+      allow update: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fcmToken']);
+      allow delete: if false;
+    }
+
+    // ---- aperturas (bitácora) ----
+    match /aperturas/{id} {
+      // staff ve todo; residente/esclavo solo su hogar
+      allow read: if signedIn() && (
+        staff() ||
+        resource.data.hogar == request.auth.uid ||
+        resource.data.hogar == get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.get('residenteUid','')
+      );
+      // los registros SOLO los escribe el Worker (service account, ignora estas reglas)
+      allow write: if false;
+    }
+
+    // ---- invitaciones ----
+    match /invitaciones/{jti} {
+      allow read: if signedIn() && (
+        staff() ||
+        resource.data.hogar == request.auth.uid ||
+        resource.data.hogar == get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.get('residenteUid','')
+      );
+      // creación/consumo de usos: SOLO el Worker
+      allow write: if false;
+    }
+    // ---- finanzas ----
+    match /finanzas/{id} {
+      // todos los usuarios autenticados ven los movimientos (residentes en lectura)
+      allow read: if signedIn();
+      // los movimientos SOLO los escribe el Worker tras verificar rol master/admin
+      allow write: if false;
+    }
+  }
+}

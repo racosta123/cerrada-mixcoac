@@ -369,13 +369,37 @@ async function loadUsers(){
       if (doc.id === ME.uid) return;
       const u = doc.data();
       const row = document.createElement('div'); row.className = 'row';
+      // Solo residentes se pueden suspender por mora. master no puede suspender admin.
+      const puedeSuspender = u.rol==='residente' && !(ME.rol==='admin' && u.rol==='admin');
+      let right;
+      if (u.suspendido){
+        right = `<span class="tag susp">Suspendido</span><button class="row-act" data-react="${doc.id}">Reactivar</button>`;
+      } else if (puedeSuspender){
+        right = `<span class="tag">${roleLabel(u.rol)}</span><button class="row-act danger" data-susp="${doc.id}">Suspender</button>`;
+      } else {
+        right = `<span class="tag">${roleLabel(u.rol)}</span>`;
+      }
       row.innerHTML = `
         <div class="ri">${(u.nombre||'?')[0].toUpperCase()}</div>
         <div class="rt"><div class="a">${esc(u.nombre)}</div><div class="b">${esc(u.email||'')} ${u.casa?'· '+esc(u.casa):''}</div></div>
-        <span class="tag">${roleLabel(u.rol)}</span>`;
+        <div style="display:flex;gap:8px;align-items:center">${right}</div>`;
       list.appendChild(row);
     });
+    list.querySelectorAll('[data-susp]').forEach(b=> b.onclick=()=> toggleSuspender(b.dataset.susp, true, b));
+    list.querySelectorAll('[data-react]').forEach(b=> b.onclick=()=> toggleSuspender(b.dataset.react, false, b));
   } catch(e){ $('#usersList').innerHTML = '<div class="empty">Error cargando usuarios</div>'; }
+}
+
+async function toggleSuspender(uid, suspender, btn){
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/usuarios/suspender', { uid, suspendido: suspender });
+    toast(suspender ? 'Residente suspendido · no podrá abrir puertas' : 'Residente reactivado', suspender?'bad':'ok');
+    loadUsers();
+  } catch(e){
+    toast(e.message || 'No se pudo actualizar', 'bad');
+    btn.disabled = false; btn.textContent = suspender ? 'Suspender' : 'Reactivar';
+  }
 }
 
 /* ====================== FINANZAS ====================== */

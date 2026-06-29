@@ -30,6 +30,7 @@ export default {
         case '/validar-qr':        out = await validarQR(req, env); break;  // lo llama el lector físico
         case '/finanzas/registrar': out = await registrarFinanza(req, env); break;
         case '/usuarios/crear':    out = await crearUsuario(req, env); break;
+        case '/usuarios/suspender': out = await suspenderUsuario(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -47,6 +48,12 @@ async function abrir(req, env) {
 
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
+  // Un residente suspendido (por mora) no puede abrir; tampoco sus esclavos.
+  if (perfil.suspendido) throw httpErr(403, 'Residente suspendido por mora');
+  if (perfil.rol === 'esclavo' && perfil.residenteUid) {
+    const padre = await getPerfil(env, perfil.residenteUid);
+    if (padre && padre.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
+  }
   // master, admin, residente y esclavo pueden abrir las 4 puertas.
   await triggerShelly(env, DOOR_CHANNELS[puerta]);
 
@@ -124,6 +131,24 @@ async function validarQR(req, env) {
   await logApertura(env, { uid:'qr', nombre:data.n, puerta:'visitantes', hogar:inv.hogar, tipo:'qr' });
   await notificarResidente(env, inv.hogar, `Visita ${data.n} entró por visitantes`);
   return json({ ok:true });
+}
+
+/* ============ /usuarios/suspender — solo staff, sobre residentes ============ */
+async function suspenderUsuario(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'No autorizado');
+
+  const { uid, suspendido } = await req.json();
+  if (!uid || typeof suspendido !== 'boolean') throw httpErr(400, 'Datos inválidos');
+  const objetivo = await getPerfil(env, uid);
+  if (!objetivo) throw httpErr(404, 'Usuario no encontrado');
+  if (objetivo.rol !== 'residente') throw httpErr(403, 'Solo se pueden suspender residentes');
+
+  await firestoreUpdate(env, `usuarios/${uid}`, {
+    suspendido: { booleanValue: suspendido },
+  }, ['suspendido']);
+  return json({ ok:true, uid, suspendido });
 }
 
 /* ============ /finanzas/registrar — solo master/admin ============ */

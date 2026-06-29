@@ -120,6 +120,9 @@ async function validarQR(req, env) {
   // Consume un uso de forma atómica
   const inv = await getInvitacion(env, data.jti);
   if (!inv || !inv.activa) throw httpErr(403, 'Invitación cancelada');
+  // Si el residente del hogar está suspendido por mora, su QR no abre (sin gastar usos ni disparar la Shelly).
+  const anfitrion = await getPerfil(env, inv.hogar);
+  if (anfitrion && anfitrion.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
   if (inv.usosRestantes !== null) {
     if (inv.usosRestantes <= 0) throw httpErr(403, 'Sin usos disponibles');
     await firestoreUpdate(env, `invitaciones/${data.jti}`, {

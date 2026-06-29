@@ -196,9 +196,12 @@
   .access-ov .glow{opacity:0}
   .access-ov.play .glow{animation:glowpulse .6s ease 1.05s}
   @keyframes glowpulse{0%{opacity:.5;transform:scale(1)}100%{opacity:0;transform:scale(1.25)}}
-  .access-ov .shackle{transform-origin:112px 96px}
-  .access-ov.play .shackle{animation:openlock .55s cubic-bezier(.5,-0.4,.35,1.5) 1.05s forwards}
-  @keyframes openlock{to{transform:translateY(-7px) rotate(-24deg)}}
+  .access-ov .shackle{transform-origin:115px 110px}
+  .access-ov.play .shackle{animation:openlock .6s cubic-bezier(.34,1.25,.5,1) 1.05s forwards}
+  @keyframes openlock{
+    0%{transform:rotate(0)}
+    100%{transform:rotate(-60deg)}
+  }
   .access-txt{color:#34d399;font-weight:800;letter-spacing:3px;font-size:18px;opacity:0;text-align:center}
   .access-txt small{display:block;color:var(--muted);font-weight:500;letter-spacing:.5px;font-size:12px;margin-top:6px}
   .access-ov.play .access-txt{animation:txtin .45s ease 1.2s forwards}
@@ -315,9 +318,10 @@
     <circle cx="100" cy="100" r="78" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="8"/>
     <circle class="ring" cx="100" cy="100" r="78" fill="none" stroke="#34d399" stroke-width="8" stroke-linecap="round"/>
     <g class="lock-grp">
-      <rect class="body" x="73" y="100" width="54" height="44" rx="9" fill="#d4af37"/>
-      <rect x="96" y="114" width="8" height="17" rx="4" fill="#1a1300"/>
-      <path class="shackle" d="M84 100 V88 a16 16 0 0 1 32 0 V100" fill="none" stroke="#cdd2d8" stroke-width="8" stroke-linecap="round"/>
+      <path class="shackle" d="M84 112 V82 a16 16 0 0 1 32 0 V112" fill="none" stroke="#c7ccd3" stroke-width="9" stroke-linecap="round"/>
+      <rect class="body" x="70" y="108" width="60" height="48" rx="11" fill="#d4af37"/>
+      <circle cx="100" cy="128" r="6" fill="#1a1300"/>
+      <rect x="97" y="130" width="6" height="15" rx="3" fill="#1a1300"/>
     </g>
   </svg>
   <div class="access-txt">ACCESO CONCEDIDO<small id="accessDoor">Puerta abierta</small></div>

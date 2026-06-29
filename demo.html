@@ -99,6 +99,8 @@
   .door.opening{border-color:var(--ok)}
   .door .state{position:absolute;top:14px;right:14px;font-size:11px;color:var(--ok);opacity:0;transition:opacity .2s}
   .door.opening .state{opacity:1}
+  .door .hold{position:absolute;left:0;bottom:0;height:4px;width:0;background:var(--ok);border-radius:0 0 var(--r) var(--r)}
+  .door.holding{border-color:var(--ok)}
 
   /* lists */
   .list{display:flex;flex-direction:column;gap:10px}
@@ -2733,14 +2735,26 @@ function renderDoors(){
   const g=$('#doorsGrid'); g.innerHTML='';
   DOORS.forEach(d=>{
     const el=document.createElement('div'); el.className='door';
-    el.innerHTML=`<div class="pulse"></div><div class="state">Abriendo…</div>
+    el.innerHTML=`<div class="pulse"></div><div class="hold"></div><div class="state">Abriendo…</div>
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="16" height="12" rx="2"/><path d="M8 9V6a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4"/></svg></div>
       <div class="dn">${d.name}</div><div class="ds">${d.sub}</div>`;
-    el.onclick=()=>openDoor(d,el);
+    bindHold(el,d);
     g.appendChild(el);
   });
 }
 let opening=false;
+function bindHold(el,d){
+  const bar=el.querySelector('.hold'); let t;
+  const start=()=>{ if(opening) return; el.classList.add('holding');
+    bar.style.transition='width 1s linear'; requestAnimationFrame(()=>{ bar.style.width='100%'; });
+    t=setTimeout(()=>{ reset(); openDoor(d,el); },1000); };
+  const reset=()=>{ clearTimeout(t); el.classList.remove('holding');
+    bar.style.transition='width .18s ease'; bar.style.width='0%'; };
+  el.addEventListener('pointerdown',start);
+  el.addEventListener('pointerup',reset);
+  el.addEventListener('pointerleave',reset);
+  el.addEventListener('pointercancel',reset);
+}
 function openDoor(d,el){
   if(opening) return; opening=true; el.classList.add('opening');
   showAccess(d.name);

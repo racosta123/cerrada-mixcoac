@@ -1,5 +1,4 @@
-# Archivos sueltos de trabajo — no se versionan.
-# Solo existe un demo.html, que se edita en su lugar.
 demo-nuevo*.html
 demo-candado*.html
 *.zip
+files*.zip

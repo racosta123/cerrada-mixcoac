@@ -13,7 +13,14 @@
      ALLOWED_ORIGIN       https://racosta123.github.io
    =========================================================== */
 
-const DOOR_CHANNELS = { visitantes:0, residentes:1, salida:2, peatones:3 };
+// Cada acceso es un Shelly físico independiente, controlado por Shelly Cloud (internet).
+// IDs reales PENDIENTES hasta elegir/instalar el hardware — no inventar valores.
+const DEVICES = {
+  residentes: "PENDIENTE_residentes",  // barrera vehicular de residentes
+  visitantes: "PENDIENTE_visitantes",  // barrera vehicular de visitas/morosos
+  peatones:   "PENDIENTE_peatones",    // puerta peatonal
+  salida:     "PENDIENTE_salida",      // puerta de salida
+};
 const STAFF = new Set(['master','admin']);
 
 export default {
@@ -44,7 +51,7 @@ export default {
 async function abrir(req, env) {
   const user = await requireAuth(req, env);
   const { puerta } = await req.json();
-  if (!(puerta in DOOR_CHANNELS)) throw httpErr(400, 'Puerta no válida');
+  if (!(puerta in DEVICES)) throw httpErr(400, 'Puerta no válida');
 
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
@@ -55,7 +62,7 @@ async function abrir(req, env) {
     if (padre && padre.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
   }
   // master, admin, residente y esclavo pueden abrir las 4 puertas.
-  await triggerShelly(env, DOOR_CHANNELS[puerta]);
+  await triggerShelly(env, DEVICES[puerta]);
 
   const hogar = perfil.rol === 'residente' ? user.uid : (perfil.residenteUid || user.uid);
   await logApertura(env, {
@@ -130,7 +137,7 @@ async function validarQR(req, env) {
     }, ['usosRestantes']);
   }
 
-  await triggerShelly(env, DOOR_CHANNELS.visitantes);
+  await triggerShelly(env, DEVICES.visitantes);
   await logApertura(env, { uid:'qr', nombre:data.n, puerta:'visitantes', hogar:inv.hogar, tipo:'qr' });
   await notificarResidente(env, inv.hogar, `Visita ${data.n} entró por visitantes`);
   return json({ ok:true });
@@ -210,12 +217,22 @@ async function crearUsuario(req, env) {
 /* ===========================================================
    SHELLY
    =========================================================== */
-async function triggerShelly(env, channel) {
-  // Shelly Gen2 RPC: dispara el relé del canal (pulso). Ajusta a tu modelo.
-  const url = `${env.SHELLY_HOST}/rpc/Switch.Set?id=${channel}&on=true`;
-  const headers = {};
-  if (env.SHELLY_AUTH_KEY) headers['Authorization'] = 'Bearer ' + env.SHELLY_AUTH_KEY;
-  const r = await fetch(url, { headers });
+async function triggerShelly(env, deviceId) {
+  // Shelly CLOUD Control API (por internet, no IP local).
+  // Cada acceso es un dispositivo Shelly propio (deviceId), no un canal compartido.
+  // Un solo "turn=on": igual que antes, sin apagado explícito desde el Worker —
+  // el pulso lo maneja el auto-off configurado en el propio Shelly.
+  const body = new URLSearchParams({
+    id: deviceId,
+    channel: '0',
+    turn: 'on',
+    auth_key: env.SHELLY_AUTH_KEY,
+  });
+  const r = await fetch(`${env.SHELLY_HOST}/device/relay/control`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
   if (!r.ok) throw httpErr(502, 'La cerradura no respondió');
 }
 

@@ -86,7 +86,8 @@
   /* doors */
   .doors{display:grid;grid-template-columns:1fr 1fr;gap:13px}
   .door{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
-    padding:18px 16px 16px;overflow:hidden;transition:transform .12s,border-color .2s}
+    padding:18px 16px 16px;overflow:hidden;transition:transform .12s,border-color .2s;
+    user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
   .door:active{transform:scale(.97)}
   .door .ic{width:46px;height:46px;border-radius:14px;background:var(--gold-dim);
     display:flex;align-items:center;justify-content:center;margin-bottom:14px}
@@ -2730,7 +2731,7 @@ function renderDoors(){
 let opening=false;
 function bindHold(el,d){
   const bar=el.querySelector('.hold'); let t;
-  const start=()=>{ if(opening) return; el.classList.add('holding');
+  const start=(e)=>{ if(opening) return; e.preventDefault(); el.classList.add('holding');
     bar.style.transition='width 1s linear'; requestAnimationFrame(()=>{ bar.style.width='100%'; });
     t=setTimeout(()=>{ reset(); openDoor(d,el); },1000); };
   const reset=()=>{ clearTimeout(t); el.classList.remove('holding');
@@ -2739,6 +2740,8 @@ function bindHold(el,d){
   el.addEventListener('pointerup',reset);
   el.addEventListener('pointerleave',reset);
   el.addEventListener('pointercancel',reset);
+  el.addEventListener('contextmenu',e=>e.preventDefault());
+  el.addEventListener('selectstart',e=>e.preventDefault());
 }
 function openDoor(d,el){
   if(opening) return; opening=true; el.classList.add('opening');

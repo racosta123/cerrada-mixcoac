@@ -165,6 +165,7 @@ function switchTab(id, btn){
   $('#tab-'+id).classList.remove('hidden');
   $$('.tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
+  if (id === 'finanzas') resizeFinCharts();
 }
 
 /* ====================== PUERTAS ====================== */
@@ -404,7 +405,9 @@ async function toggleSuspender(uid, suspender, btn){
 
 /* ====================== FINANZAS ====================== */
 let movType = 'ingreso';
-let finCache = [];
+let finCache = [];      // movimientos de los últimos 6 meses (solo lectura)
+let finMonths = [];     // [{key,start,end,label}] los últimos 6 meses, más viejo primero
+let finCharts = { barras:null, pastel:null, linea:null };
 
 function monthRange(){
   const now = new Date();
@@ -412,7 +415,22 @@ function monthRange(){
   const end = new Date(now.getFullYear(), now.getMonth()+1, 1);
   return { start, end, label: now.toLocaleDateString('es-MX',{month:'long',year:'numeric'}) };
 }
+function last6Months(){
+  const now = new Date();
+  const arr = [];
+  for (let i=5; i>=0; i--){
+    const d = new Date(now.getFullYear(), now.getMonth()-i, 1);
+    arr.push({
+      key: d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'),
+      start: new Date(d.getFullYear(), d.getMonth(), 1),
+      end: new Date(d.getFullYear(), d.getMonth()+1, 1),
+      label: d.toLocaleDateString('es-MX',{month:'short',year:'2-digit'}),
+    });
+  }
+  return arr;
+}
 const money = n => '$'+(n||0).toLocaleString('es-MX',{minimumFractionDigits:0,maximumFractionDigits:2});
+const monthKey = ts => { const d = ts.toDate ? ts.toDate() : new Date(ts); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); };
 
 function watchFinanzas(){
   if (unsubFin) unsubFin();
@@ -420,31 +438,148 @@ function watchFinanzas(){
   // Solo staff registra; residentes/esclavos ven en modo lectura.
   $('#newMovBtn').style.display = isStaff ? 'block' : 'none';
 
-  const { start, end, label } = monthRange();
+  finMonths = last6Months();
+  const { label } = monthRange();
   $('#finMonth').textContent = 'Finanzas · ' + label;
+
   unsubFin = db.collection('finanzas')
-    .where('ts','>=',start).where('ts','<',end)
-    .orderBy('ts','desc').limit(300)
+    .where('ts','>=',finMonths[0].start)
+    .orderBy('ts','desc').limit(1200)
     .onSnapshot(snap => {
       finCache = [];
-      let cobrado = 0, gastos = 0;
-      snap.forEach(doc => {
-        const m = doc.data(); finCache.push(m);
-        if (m.tipo==='ingreso') cobrado += m.monto; else gastos += m.monto;
-      });
-      $('#finCobrado').textContent = money(cobrado);
-      $('#finGastos').textContent = money(gastos);
-      $('#finCaja').textContent = money(cobrado - gastos);
-      renderMovs(snap);
+      snap.forEach(doc => finCache.push(doc.data()));
+      renderFinanzas();
     }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
 }
 
-function renderMovs(snap){
+function groupByMonth(){
+  const map = {};
+  finMonths.forEach(m => map[m.key] = { ingreso:0, gasto:0 });
+  finCache.forEach(m => {
+    const k = monthKey(m.ts);
+    if (!map[k]) return; // fuera de la ventana de 6 meses visible
+    if (m.tipo==='ingreso') map[k].ingreso += m.monto; else map[k].gasto += m.monto;
+  });
+  return map;
+}
+
+function renderCmp(el, cur, prev, higherIsBetter){
+  if (!cur && !prev){ el.innerHTML = '<span class="muted">Sin datos mes pasado</span>'; return; }
+  if (!prev){ el.innerHTML = '<span class="muted">Sin datos mes pasado</span>'; return; }
+  const pct = ((cur - prev) / prev) * 100;
+  const up = pct >= 0;
+  const good = higherIsBetter ? up : !up;
+  el.innerHTML = `<span class="${good?'ok':'bad'}">${up?'▲':'▼'}${Math.abs(pct).toFixed(0)}% vs mes pasado</span>`;
+}
+
+function renderFinanzas(){
+  const byMonth = groupByMonth();
+  const curKey = finMonths[finMonths.length-1].key;
+  const prevKey = finMonths[finMonths.length-2].key;
+  const cur = byMonth[curKey], prev = byMonth[prevKey];
+
+  const cobrado = cur.ingreso, gastos = cur.gasto, caja = cur.ingreso - cur.gasto;
+  const prevCaja = prev.ingreso - prev.gasto;
+
+  $('#finCobrado').textContent = money(cobrado);
+  $('#finGastos').textContent = money(gastos);
+  $('#finCaja').textContent = money(caja);
+
+  renderCmp($('#cmpCobrado'), cobrado, prev.ingreso, true);
+  renderCmp($('#cmpGastos'), gastos, prev.gasto, false);
+  renderCmp($('#cmpCaja'), caja, prevCaja, true);
+
+  renderFinCharts(byMonth, curKey);
+  populateFiltros();
+  filterAndRenderMovs();
+}
+
+/* -------- gráficas (Chart.js) -------- */
+function renderFinCharts(byMonth, curKey){
+  if (typeof Chart === 'undefined') return;
+  const gold='#d4af37', goldSoft='#e8c468', ok='#34d399', bad='#f87171', muted='#a1a1aa', text='#f5f5f4', line='#2a2a30';
+
+  const labels = finMonths.map(m => m.label);
+  const ingresos = finMonths.map(m => byMonth[m.key].ingreso);
+  const gastosArr = finMonths.map(m => byMonth[m.key].gasto);
+  const saldos = finMonths.map(m => byMonth[m.key].ingreso - byMonth[m.key].gasto);
+
+  if (finCharts.barras) finCharts.barras.destroy();
+  finCharts.barras = new Chart($('#chartBarras'), {
+    type:'bar',
+    data:{ labels, datasets:[
+      { label:'Ingresos', data:ingresos, backgroundColor:ok, borderRadius:4, maxBarThickness:26 },
+      { label:'Gastos', data:gastosArr, backgroundColor:bad, borderRadius:4, maxBarThickness:26 },
+    ]},
+    options:{ responsive:true, plugins:{ legend:{ labels:{ color:text } } },
+      scales:{ x:{ ticks:{ color:muted }, grid:{ color:line } }, y:{ ticks:{ color:muted }, grid:{ color:line }, beginAtZero:true } } }
+  });
+
+  const catTotals = {};
+  finCache.filter(m => m.tipo==='egreso' && monthKey(m.ts)===curKey).forEach(m => {
+    const c = m.categoria || 'Otro';
+    catTotals[c] = (catTotals[c]||0) + m.monto;
+  });
+  const catLabels = Object.keys(catTotals);
+  const palette = [gold, goldSoft, ok, bad, muted, '#9c7d1e', '#3b82f6'];
+
+  if (finCharts.pastel) finCharts.pastel.destroy();
+  finCharts.pastel = new Chart($('#chartPastel'), {
+    type:'pie',
+    data:{
+      labels: catLabels.length ? catLabels : ['Sin gastos'],
+      datasets:[{
+        data: catLabels.length ? catLabels.map(c=>catTotals[c]) : [1],
+        backgroundColor: catLabels.length ? catLabels.map((_,i)=>palette[i%palette.length]) : [line],
+      }],
+    },
+    options:{ responsive:true, plugins:{ legend:{ position:'bottom', labels:{ color:text, boxWidth:12 } } } }
+  });
+
+  if (finCharts.linea) finCharts.linea.destroy();
+  finCharts.linea = new Chart($('#chartLinea'), {
+    type:'line',
+    data:{ labels, datasets:[{
+      label:'Saldo en caja', data:saldos, borderColor:gold, backgroundColor:'rgba(212,175,55,.15)',
+      fill:true, tension:.35, pointBackgroundColor:gold,
+    }]},
+    options:{ responsive:true, plugins:{ legend:{ display:false } },
+      scales:{ x:{ ticks:{ color:muted }, grid:{ color:line } }, y:{ ticks:{ color:muted }, grid:{ color:line } } } }
+  });
+}
+function resizeFinCharts(){
+  requestAnimationFrame(()=> Object.values(finCharts).forEach(c => c && c.resize()));
+}
+
+/* -------- filtros (100% client-side sobre finCache) -------- */
+function populateFiltros(){
+  const selCat = $('#filtroCategoria');
+  const curCat = selCat.value;
+  const cats = [...new Set(finCache.map(m=>m.categoria||'Otro'))].sort();
+  selCat.innerHTML = '<option value="">Todas las categorías</option>' + cats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  selCat.value = cats.includes(curCat) ? curCat : '';
+
+  const selMes = $('#filtroMes');
+  const curMes = selMes.value;
+  selMes.innerHTML = '<option value="">Todos los meses</option>' + finMonths.slice().reverse().map(m=>`<option value="${m.key}">${esc(m.label)}</option>`).join('');
+  selMes.value = finMonths.some(m=>m.key===curMes) ? curMes : '';
+}
+function filterAndRenderMovs(){
+  const cat = $('#filtroCategoria').value;
+  const mes = $('#filtroMes').value;
+  let list = finCache;
+  if (cat) list = list.filter(m => (m.categoria||'Otro') === cat);
+  if (mes) list = list.filter(m => monthKey(m.ts) === mes);
+  renderMovs(list);
+}
+$('#filtroCategoria').addEventListener('change', filterAndRenderMovs);
+$('#filtroMes').addEventListener('change', filterAndRenderMovs);
+
+function renderMovs(movs){
   const list = $('#movList');
-  if (snap.empty){ list.innerHTML = '<div class="empty">Sin movimientos este mes</div>'; return; }
+  if (!movs.length){ list.innerHTML = '<div class="empty">Sin movimientos</div>'; return; }
   list.innerHTML = '';
-  snap.forEach(doc => {
-    const m = doc.data();
+  movs.forEach(m => {
     const ing = m.tipo==='ingreso';
     const row = document.createElement('div'); row.className = 'row';
     row.innerHTML = `
@@ -500,8 +635,12 @@ function generarPDF(){
   doc.setFont('helvetica','normal'); doc.setFontSize(11); doc.setTextColor(200);
   doc.text('Reporte de finanzas · '+label, 88, 64);
 
+  // finCache trae 6 meses; el reporte PDF es mensual, así que se filtra al mes en curso.
+  const curKey = finMonths.length ? finMonths[finMonths.length-1].key : monthKey(new Date());
+  const monthMovs = finCache.filter(m => monthKey(m.ts) === curKey);
+
   let cobrado=0, gastos=0;
-  finCache.forEach(m => m.tipo==='ingreso' ? cobrado+=m.monto : gastos+=m.monto);
+  monthMovs.forEach(m => m.tipo==='ingreso' ? cobrado+=m.monto : gastos+=m.monto);
 
   // Tarjetas resumen
   const cy = 120, cw=(W-80-24)/3;
@@ -515,13 +654,31 @@ function generarPDF(){
     doc.text(c[1], x+12, cy+46); doc.setFont('helvetica','normal');
   });
 
-  // Tabla de movimientos
-  const rows = finCache.map(m => [
+  // Gráficas (Ingresos vs Gastos, Gastos por categoría, Saldo en caja)
+  let gy = cy + 64 + 24;
+  const addChartImage = (canvasId, maxH) => {
+    const c = document.getElementById(canvasId);
+    if (!c || !c.width || !c.height) return;
+    const boxW = W - 80;
+    const imgH = Math.min(maxH, boxW * (c.height / c.width));
+    let img;
+    try { img = c.toDataURL('image/png'); } catch(e){ console.error('chart image', e); return; }
+    doc.setDrawColor(225); doc.setFillColor(250,250,250);
+    doc.roundedRect(40, gy, boxW, imgH + 16, 8, 8, 'FD');
+    doc.addImage(img, 'PNG', 48, gy + 8, boxW - 16, imgH);
+    gy += imgH + 16 + 12;
+  };
+  addChartImage('chartBarras', 140);
+  addChartImage('chartPastel', 140);
+  addChartImage('chartLinea', 120);
+
+  // Tabla de movimientos del mes
+  const rows = monthMovs.map(m => [
     fmtTime(m.ts), m.tipo==='ingreso'?'Ingreso':'Gasto', m.categoria||'', m.concepto||'',
     (m.tipo==='ingreso'?'+':'−')+money(m.monto)
   ]);
   doc.autoTable({
-    startY: 208,
+    startY: gy + 10,
     head: [['Fecha','Tipo','Categoría','Concepto','Monto']],
     body: rows.length?rows:[['—','—','—','Sin movimientos','—']],
     theme:'striped',

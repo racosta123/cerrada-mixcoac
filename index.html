@@ -147,12 +147,23 @@
   .fin-label{font-size:11px;color:var(--muted);letter-spacing:.3px;margin-bottom:7px}
   .fin-val{font-size:17px;font-weight:700;letter-spacing:.2px}
   .fin-val.ok{color:var(--ok)} .fin-val.bad{color:var(--bad)}
+  .fin-cmp{font-size:11px;margin-top:5px;min-height:14px;letter-spacing:.2px}
+  .fin-cmp .ok{color:var(--ok)} .fin-cmp .bad{color:var(--bad)} .fin-cmp .muted{color:var(--muted-2)}
   .fin-actions{display:flex;gap:10px;margin-bottom:6px}
   .fin-actions .btn-primary{margin-top:0;flex:1}
   .btn-ghost{flex:1;padding:15px;border-radius:var(--r-sm);background:var(--surface);border:1px solid var(--line);color:var(--gold-soft);font-size:14px;font-weight:600}
   .btn-ghost:active{transform:scale(.985)}
   .mov-amt{font-size:14px;font-weight:700;white-space:nowrap}
   .mov-amt.ok{color:var(--ok)} .mov-amt.bad{color:var(--bad)}
+  .fin-charts{display:flex;flex-direction:column;gap:12px;margin:14px 0}
+  .fin-chart-box{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 12px}
+  .fin-chart-title{font-size:11px;color:var(--muted);letter-spacing:.3px;margin-bottom:10px;text-transform:uppercase}
+  .fin-filters{display:flex;gap:10px;margin:0 0 12px}
+  .fin-filters select{
+    flex:1;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+    color:var(--text);font-size:13px;padding:10px 12px;font-family:inherit;
+  }
+  .fin-filters select:focus{outline:none;border-color:var(--gold)}
 
   /* ---------- TAB BAR ---------- */
   .tabbar{
@@ -292,23 +303,44 @@
         <div class="fin-bar" style="background:var(--ok)"></div>
         <div class="fin-label">Cobrado</div>
         <div class="fin-val ok" id="finCobrado">$0</div>
+        <div class="fin-cmp" id="cmpCobrado"></div>
       </div>
       <div class="fin-card">
         <div class="fin-bar" style="background:var(--bad)"></div>
         <div class="fin-label">Gastos</div>
         <div class="fin-val bad" id="finGastos">$0</div>
+        <div class="fin-cmp" id="cmpGastos"></div>
       </div>
       <div class="fin-card">
         <div class="fin-bar" style="background:var(--gold)"></div>
         <div class="fin-label">En caja</div>
         <div class="fin-val" id="finCaja">$0</div>
+        <div class="fin-cmp" id="cmpCaja"></div>
+      </div>
+    </div>
+    <div class="fin-charts">
+      <div class="fin-chart-box">
+        <div class="fin-chart-title">Ingresos vs Gastos · 6 meses</div>
+        <canvas id="chartBarras" height="180"></canvas>
+      </div>
+      <div class="fin-chart-box">
+        <div class="fin-chart-title">Gastos por categoría · este mes</div>
+        <canvas id="chartPastel" height="180"></canvas>
+      </div>
+      <div class="fin-chart-box">
+        <div class="fin-chart-title">Saldo en caja · 6 meses</div>
+        <canvas id="chartLinea" height="150"></canvas>
       </div>
     </div>
     <div class="fin-actions">
       <button class="btn-primary" id="newMovBtn" style="margin-top:0">Registrar movimiento</button>
       <button class="btn-ghost" id="pdfBtn">Reporte PDF</button>
     </div>
-    <div class="section-title">Movimientos del mes</div>
+    <div class="section-title">Movimientos</div>
+    <div class="fin-filters">
+      <select id="filtroCategoria"><option value="">Todas las categorías</option></select>
+      <select id="filtroMes"><option value="">Todos los meses</option></select>
+    </div>
     <div class="list" id="movList"><div class="empty">Sin movimientos</div></div>
   </div>
 
@@ -407,6 +439,7 @@
 <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script src="config.js"></script>
 <script src="app.js"></script>
 </body>

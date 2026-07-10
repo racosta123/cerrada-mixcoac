@@ -2,3 +2,5 @@ demo-nuevo*.html
 demo-candado*.html
 *.zip
 files*.zip
+config.js
+.wrangler/

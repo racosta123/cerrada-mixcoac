@@ -23,9 +23,15 @@ const DEVICES = {
 };
 const STAFF = new Set(['master','admin']);
 
+// SOLO DESARROLLO: permite probar el Worker desde el servidor local de pruebas.
+// Quitar esta línea cuando ya no se necesite probar desde localhost.
+const DEV_ORIGINS = ['http://localhost:4173'];
+
 export default {
   async fetch(req, env) {
-    const origin = env.ALLOWED_ORIGIN || '*';
+    const reqOrigin = req.headers.get('Origin') || '';
+    const allowed = new Set([env.ALLOWED_ORIGIN, ...DEV_ORIGINS].filter(Boolean));
+    const origin = allowed.has(reqOrigin) ? reqOrigin : (env.ALLOWED_ORIGIN || '*');
     if (req.method === 'OPTIONS') return cors(new Response(null,{status:204}), origin);
 
     const url = new URL(req.url);
@@ -418,14 +424,42 @@ function b64urlToBytes(s){
 }
 function b64urlToStr(s){ return new TextDecoder().decode(b64urlToBytes(s)); }
 
+// Lee un TLV DER en `offset`: soporta longitud corta y larga (suficiente para certs X.509).
+function derReadTLV(bytes, offset){
+  const tag = bytes[offset];
+  const lenByte = bytes[offset+1];
+  let length, lenOffset = offset+2;
+  if (lenByte & 0x80){
+    const numBytes = lenByte & 0x7f;
+    length = 0;
+    for (let i=0;i<numBytes;i++) length = (length<<8) | bytes[lenOffset+i];
+    lenOffset += numBytes;
+  } else {
+    length = lenByte;
+  }
+  return { tag, contentStart: lenOffset, totalLen: (lenOffset-offset)+length };
+}
+// Certificate ::= SEQUENCE { tbsCertificate, sigAlg, sig }
+// tbsCertificate ::= SEQUENCE { [0] version?, serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo, ... }
+// El SPKI que necesita crypto.subtle.importKey('spki', ...) está anidado ahí adentro, hay que extraerlo.
+function extractSpkiFromX509(der){
+  const cert = derReadTLV(der, 0);
+  const tbs = derReadTLV(der, cert.contentStart);
+  let p = tbs.contentStart;
+  let el = derReadTLV(der, p);
+  if (el.tag === 0xA0) p += el.totalLen; // version [0] EXPLICIT, opcional
+  for (let i=0; i<5; i++){ el = derReadTLV(der, p); p += el.totalLen; } // serialNumber, signature, issuer, validity, subject
+  el = derReadTLV(der, p); // subjectPublicKeyInfo
+  return der.slice(p, p + el.totalLen);
+}
 async function importX509(pem){
   const der = pemToDer(pem);
-  // Extrae la clave pública del certificado X.509
-  return crypto.subtle.importKey('spki', der, { name:'RSASSA-PKCS1-v1_5', hash:'SHA-256' }, false, ['verify'])
-    .catch(async ()=> {
-      // Algunos runtimes requieren importar el cert completo; fallback a spki ya intentado.
-      throw httpErr(500, 'No se pudo importar la clave de Google');
-    });
+  try {
+    const spki = extractSpkiFromX509(der);
+    return await crypto.subtle.importKey('spki', spki, { name:'RSASSA-PKCS1-v1_5', hash:'SHA-256' }, false, ['verify']);
+  } catch (e) {
+    throw httpErr(500, 'No se pudo importar la clave de Google');
+  }
 }
 async function importPKCS8(pem){
   const der = pemToDer(pem);

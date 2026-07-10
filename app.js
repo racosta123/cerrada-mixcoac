@@ -408,6 +408,38 @@ let movType = 'ingreso';
 let finCache = [];      // movimientos de los últimos 6 meses (solo lectura)
 let finMonths = [];     // [{key,start,end,label}] los últimos 6 meses, más viejo primero
 let finCharts = { barras:null, pastel:null, linea:null };
+// Paleta compartida: colores de las categorías en la dona del PDF y su leyenda nativa (mismo orden,
+// gama sobria para papel: dorado, ocre, terracota, verde seco + tonos tierra de respaldo).
+const DOUGHNUT_PALETTE = ['#d4a017', '#d97706', '#b7472a', '#6b8e63', '#8a6d3b', '#94a3b8'];
+function hexToRgb(hex){
+  const n = parseInt(hex.replace('#',''), 16);
+  return [(n>>16)&255, (n>>8)&255, n&255];
+}
+// Identidad visual del PDF "despacho contable" (FASE 0 del plan maestro).
+const PDF = {
+  text: [17,24,39],        // #111827 — nunca negro puro
+  secondary: [100,116,139],// #64748b
+  notes: [156,163,175],    // #9ca3af
+  gold: [212,160,23],      // #d4a017 — solo filetes/acentos
+  green: [15,118,110],     // #0f766e — ingresos
+  red: [153,27,27],        // #991b1b — gastos
+  navy: [30,58,138],       // #1e3a8a — saldo
+  grid: [226,232,240],     // #e2e8f0
+  zebra: [248,250,252],    // #f8fafc
+  badgeGreenBg: [204,251,241], badgeGreenFg: [15,118,110],
+  badgeRedBg: [254,226,226], badgeRedFg: [153,27,27],
+  MARGIN: 25 * 72 / 25.4,  // 25mm en pt
+};
+/* folio determinista FIN-YYYYMM-### — no hay contador persistente en Firestore (fuera de alcance
+   escribir uno sin autorización), así que se deriva de mes+totales: estable mientras no cambien
+   los movimientos del mes, único por combinación mes/monto. */
+function folioDelMes(curKey, cobrado, gastos){
+  const seed = curKey.replace('-','') + '|' + Math.round(cobrado) + '|' + Math.round(gastos);
+  let hash = 0;
+  for (let i=0;i<seed.length;i++) hash = (hash*31 + seed.charCodeAt(i)) >>> 0;
+  const num = (hash % 900) + 100;
+  return `FIN-${curKey.replace('-','')}-${num}`;
+}
 
 function monthRange(){
   const now = new Date();
@@ -494,6 +526,32 @@ function renderFinanzas(){
   filterAndRenderMovs();
 }
 
+/* -------- gastos por categoría del mes (compartido: dashboard + PDF) -------- */
+function categoriasDelMes(curKey){
+  const catTotals = {};
+  finCache.filter(m => m.tipo==='egreso' && monthKey(m.ts)===curKey).forEach(m => {
+    const c = m.categoria || 'Otro';
+    catTotals[c] = (catTotals[c]||0) + m.monto;
+  });
+  const labels = Object.keys(catTotals);
+  return {
+    labels: labels.length ? labels : ['Sin gastos'],
+    data: labels.length ? labels.map(c=>catTotals[c]) : [1],
+    hasData: labels.length > 0,
+  };
+}
+
+/* meses con al menos un movimiento (para no graficar 5 meses vacíos en el PDF) */
+function mesesConMovimientos(byMonth){
+  const activos = finMonths.filter(m => byMonth[m.key].ingreso > 0 || byMonth[m.key].gasto > 0);
+  const usados = activos.length ? activos : [finMonths[finMonths.length-1]];
+  return {
+    labels: usados.map(m => m.label),
+    ingresos: usados.map(m => byMonth[m.key].ingreso),
+    gastos: usados.map(m => byMonth[m.key].gasto),
+  };
+}
+
 /* -------- gráficas (Chart.js) -------- */
 function renderFinCharts(byMonth, curKey){
   if (typeof Chart === 'undefined') return;
@@ -515,22 +573,17 @@ function renderFinCharts(byMonth, curKey){
       scales:{ x:{ ticks:{ color:muted }, grid:{ color:line } }, y:{ ticks:{ color:muted }, grid:{ color:line }, beginAtZero:true } } }
   });
 
-  const catTotals = {};
-  finCache.filter(m => m.tipo==='egreso' && monthKey(m.ts)===curKey).forEach(m => {
-    const c = m.categoria || 'Otro';
-    catTotals[c] = (catTotals[c]||0) + m.monto;
-  });
-  const catLabels = Object.keys(catTotals);
+  const { labels: catLabels, data: catData, hasData } = categoriasDelMes(curKey);
   const palette = [gold, goldSoft, ok, bad, muted, '#9c7d1e', '#3b82f6'];
 
   if (finCharts.pastel) finCharts.pastel.destroy();
   finCharts.pastel = new Chart($('#chartPastel'), {
     type:'pie',
     data:{
-      labels: catLabels.length ? catLabels : ['Sin gastos'],
+      labels: catLabels,
       datasets:[{
-        data: catLabels.length ? catLabels.map(c=>catTotals[c]) : [1],
-        backgroundColor: catLabels.length ? catLabels.map((_,i)=>palette[i%palette.length]) : [line],
+        data: catData,
+        backgroundColor: hasData ? catLabels.map((_,i)=>palette[i%palette.length]) : [line],
       }],
     },
     options:{ responsive:true, plugins:{ legend:{ position:'bottom', labels:{ color:text, boxWidth:12 } } } }
@@ -549,6 +602,184 @@ function renderFinCharts(byMonth, curKey){
 }
 function resizeFinCharts(){
   requestAnimationFrame(()=> Object.values(finCharts).forEach(c => c && c.resize()));
+}
+
+/* -------- barras (Ingresos vs Gastos) en alta resolución, solo para el PDF --------
+   Colores de la identidad "despacho contable" (verde/rojo oscuros, legibles en papel blanco).
+   Sin leyenda horneada — esa va como texto nativo (ver dibujarLeyendaSeries). Valores encima
+   de cada barra vía plugin propio (afterDatasetsDraw), grid casi invisible. */
+async function renderBarrasHiRes(labels, ingresos, gastos){
+  const off = document.createElement('canvas');
+  off.width = 1400; off.height = 700;
+
+  const valueLabelsPlugin = {
+    id: 'valueLabels',
+    afterDatasetsDraw(chart){
+      const { ctx } = chart;
+      chart.data.datasets.forEach((dataset, di) => {
+        const meta = chart.getDatasetMeta(di);
+        meta.data.forEach((bar, i) => {
+          const value = dataset.data[i];
+          if (!value) return;
+          ctx.save();
+          ctx.fillStyle = '#111827';
+          ctx.font = 'bold 20px Helvetica, Arial, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(money(value), bar.x, bar.y - 12);
+          ctx.restore();
+        });
+      });
+    },
+  };
+
+  const chart = new Chart(off, {
+    type:'bar',
+    data:{ labels, datasets:[
+      { label:'Ingresos', data:ingresos, backgroundColor:'#0f766e', borderRadius:6, maxBarThickness:46 },
+      { label:'Gastos', data:gastos, backgroundColor:'#991b1b', borderRadius:6, maxBarThickness:46 },
+    ]},
+    options:{
+      responsive:false, animation:false,
+      layout:{ padding:{ top:36 } },
+      plugins:{ legend:{ display:false }, tooltip:{ enabled:false } },
+      scales:{
+        x:{ ticks:{ color:'#64748b', font:{ size:22 } }, grid:{ display:false } },
+        y:{ ticks:{ color:'#64748b', font:{ size:20 } }, grid:{ color:'#e2e8f0' }, beginAtZero:true },
+      },
+    },
+    plugins: [valueLabelsPlugin],
+  });
+  await new Promise(r => setTimeout(r, 0));
+  const dataUrl = off.toDataURL('image/png');
+  chart.destroy();
+  return dataUrl;
+}
+/* leyenda nativa simple (swatch + texto) para series de una gráfica, ej. Ingresos/Gastos */
+function dibujarLeyendaSeries(doc, W, gy, items){
+  const itemW = 110;
+  let x = (W - items.length*itemW) / 2;
+  items.forEach(({label, color}) => {
+    doc.setFillColor(...hexToRgb(color));
+    doc.roundedRect(x, gy, 12, 12, 3, 3, 'F');
+    doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...PDF.text);
+    doc.text(label, x + 18, gy + 10);
+    x += itemW;
+  });
+  return gy + 12 + 14;
+}
+
+/* -------- doughnut de gastos en alta resolución, solo para el PDF --------
+   Solo el círculo (+ total al centro): sin leyenda ni etiquetas de categoría horneadas en la
+   imagen — esas van como texto nativo del PDF (ver dibujarLeyendaCategorias), para que queden
+   nítidas a cualquier zoom en vez de pixeleadas dentro de un PNG. */
+async function renderPastelDoughnutHiRes(catLabels, catData, hasData, totalTexto){
+  const SIZE = 900; // px reales del canvas (cuadrado, > 800 mínimo pedido)
+  const off = document.createElement('canvas');
+  off.width = SIZE; off.height = SIZE;
+
+  const shadowPlugin = {
+    id: 'donutShadow',
+    beforeDatasetDraw(chart){
+      const ctx = chart.ctx;
+      ctx.save();
+      ctx.shadowColor = 'rgba(0,0,0,.30)';
+      ctx.shadowBlur = 22;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 8;
+    },
+    afterDatasetDraw(chart){ chart.ctx.restore(); },
+  };
+  const centerTextPlugin = {
+    id: 'centerText',
+    afterDraw(chart){
+      const { ctx, chartArea } = chart;
+      if (!chartArea) return;
+      const cx = (chartArea.left + chartArea.right) / 2;
+      const cy = (chartArea.top + chartArea.bottom) / 2;
+      ctx.save();
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#111827';
+      ctx.font = 'bold 46px Helvetica, Arial, sans-serif';
+      ctx.fillText(totalTexto, cx, cy - 16);
+      ctx.fillStyle = '#64748b';
+      ctx.font = '24px Helvetica, Arial, sans-serif';
+      ctx.fillText('Total gastos', cx, cy + 28);
+      ctx.restore();
+    },
+  };
+
+  const chart = new Chart(off, {
+    type:'doughnut',
+    data:{
+      labels: catLabels,
+      datasets:[{
+        data: catData,
+        backgroundColor: hasData ? catLabels.map((_,i)=>DOUGHNUT_PALETTE[i%DOUGHNUT_PALETTE.length]) : ['#d8d8d8'],
+        borderColor:'#ffffff',
+        borderWidth:4,
+      }],
+    },
+    options:{
+      responsive:false,
+      animation:false,
+      devicePixelRatio:1,
+      cutout:'55%',
+      layout:{ padding:24 },
+      plugins:{ legend:{ display:false }, tooltip:{ enabled:false } },
+    },
+    plugins: [shadowPlugin, centerTextPlugin],
+  });
+
+  // Con animation:false, Chart.js ya pintó de forma síncrona. Se usa setTimeout (no rAF)
+  // porque rAF nunca se dispara si la pestaña está en segundo plano al generar el PDF.
+  await new Promise(r => setTimeout(r, 0));
+  const dataUrl = off.toDataURL('image/png');
+  chart.destroy();
+  return dataUrl;
+}
+
+/* leyenda nativa del PDF: cuadrito de color + nombre + porcentaje + monto, texto real (no imagen).
+   `x0` permite dibujarla a la derecha de la dona en vez de a todo el ancho. */
+function dibujarLeyendaCategorias(doc, W, gy, catLabels, catData, hasData, x0, x1){
+  x0 = x0 ?? 40; x1 = x1 ?? (W - 40);
+  if (!hasData){
+    doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(...PDF.notes);
+    doc.text('Sin gastos registrados este mes.', x0, gy + 14);
+    return gy + 26;
+  }
+  const total = catData.reduce((a,b)=>a+b, 0) || 1;
+  const rowH = 24;
+  catLabels.forEach((catLabel, i) => {
+    const y = gy + i*rowH;
+    doc.setFillColor(...hexToRgb(DOUGHNUT_PALETTE[i % DOUGHNUT_PALETTE.length]));
+    doc.roundedRect(x0, y, 12, 12, 3, 3, 'F');
+    doc.setFont('helvetica','bold'); doc.setFontSize(10.5); doc.setTextColor(...PDF.text);
+    doc.text(catLabel, x0 + 18, y + 10);
+    const pct = Math.round(catData[i] / total * 100);
+    doc.setFont('courier','bold'); doc.setFontSize(9.5); doc.setTextColor(...PDF.secondary);
+    doc.text(`${pct}% · ${money(catData[i])}`, x1, y + 10, { align:'right' });
+  });
+  return gy + catLabels.length*rowH + 12;
+}
+
+/* indicador de salud financiera: barra proporción gastos/ingresos + línea de lectura */
+function dibujarSaludFinanciera(doc, W, gy, cobrado, gastos){
+  const x0 = PDF.MARGIN, x1 = W - PDF.MARGIN, barW = x1 - x0, barH = 8;
+  if (!(cobrado > 0)){
+    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.notes);
+    doc.text('Sin datos suficientes para el indicador de salud financiera este mes.', x0, gy + 10);
+    return gy + 24;
+  }
+  const pct = Math.min(gastos / cobrado, 1);
+  const color = pct < 0.5 ? PDF.green : pct < 0.8 ? PDF.gold : PDF.red;
+  doc.setFillColor(...PDF.grid);
+  doc.roundedRect(x0, gy, barW, barH, 4, 4, 'F');
+  doc.setFillColor(...color);
+  doc.roundedRect(x0, gy, Math.max(barW*pct, barH), barH, 4, 4, 'F');
+  doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(...PDF.secondary);
+  const pctTxt = Math.round(pct*100);
+  doc.text(`Los gastos representan el ${pctTxt}% de lo recaudado este mes.`, x0, gy + barH + 14);
+  return gy + barH + 28;
 }
 
 /* -------- filtros (100% client-side sobre finCache) -------- */
@@ -617,83 +848,253 @@ async function saveMov(){
   finally { btn.disabled = false; btn.textContent = 'Guardar movimiento'; }
 }
 
-/* reporte PDF para el grupo de residentes */
-$('#pdfBtn').addEventListener('click', generarPDF);
+/* resumen del mes formateado para WhatsApp (negritas con asteriscos) */
+$('#waBtn').addEventListener('click', copiarParaWhatsApp);
 
-function generarPDF(){
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit:'pt', format:'a4' });
-  const W = doc.internal.pageSize.getWidth();
+function textoWhatsApp(){
   const { label } = monthRange();
-  const gold = [184,148,31], green=[34,160,110], red=[200,70,70], dark=[20,20,23];
-
-  // Encabezado
-  doc.setFillColor(...dark); doc.rect(0,0,W,90,'F');
-  doc.setFillColor(...gold); doc.roundedRect(40,28,34,34,8,8,'F');
-  doc.setTextColor(255); doc.setFont('helvetica','bold'); doc.setFontSize(18);
-  doc.text('Cerrada Mixcoac', 88, 46);
-  doc.setFont('helvetica','normal'); doc.setFontSize(11); doc.setTextColor(200);
-  doc.text('Reporte de finanzas · '+label, 88, 64);
-
-  // finCache trae 6 meses; el reporte PDF es mensual, así que se filtra al mes en curso.
   const curKey = finMonths.length ? finMonths[finMonths.length-1].key : monthKey(new Date());
   const monthMovs = finCache.filter(m => monthKey(m.ts) === curKey);
 
-  let cobrado=0, gastos=0;
-  monthMovs.forEach(m => m.tipo==='ingreso' ? cobrado+=m.monto : gastos+=m.monto);
-
-  // Tarjetas resumen
-  const cy = 120, cw=(W-80-24)/3;
-  const cards = [['Cobrado',money(cobrado),green],['Gastos',money(gastos),red],['En caja',money(cobrado-gastos),gold]];
-  cards.forEach((c,i)=>{
-    const x = 40 + i*(cw+12);
-    doc.setDrawColor(225); doc.setFillColor(250,250,250);
-    doc.roundedRect(x,cy,cw,64,8,8,'FD');
-    doc.setFontSize(9); doc.setTextColor(120); doc.text(c[0], x+12, cy+22);
-    doc.setFont('helvetica','bold'); doc.setFontSize(15); doc.setTextColor(...c[2]);
-    doc.text(c[1], x+12, cy+46); doc.setFont('helvetica','normal');
+  let cobrado = 0, gastos = 0;
+  const porCategoriaIngreso = {}, porCategoriaGasto = {};
+  monthMovs.forEach(m => {
+    const cat = m.categoria || 'Otro';
+    if (m.tipo === 'ingreso'){ cobrado += m.monto; porCategoriaIngreso[cat] = (porCategoriaIngreso[cat]||0) + m.monto; }
+    else { gastos += m.monto; porCategoriaGasto[cat] = (porCategoriaGasto[cat]||0) + m.monto; }
   });
 
-  // Gráficas (Ingresos vs Gastos, Gastos por categoría, Saldo en caja)
-  let gy = cy + 64 + 24;
-  const addChartImage = (canvasId, maxH) => {
-    const c = document.getElementById(canvasId);
-    if (!c || !c.width || !c.height) return;
-    const boxW = W - 80;
-    const imgH = Math.min(maxH, boxW * (c.height / c.width));
-    let img;
-    try { img = c.toDataURL('image/png'); } catch(e){ console.error('chart image', e); return; }
-    doc.setDrawColor(225); doc.setFillColor(250,250,250);
-    doc.roundedRect(40, gy, boxW, imgH + 16, 8, 8, 'FD');
-    doc.addImage(img, 'PNG', 48, gy + 8, boxW - 16, imgH);
-    gy += imgH + 16 + 12;
-  };
-  addChartImage('chartBarras', 140);
-  addChartImage('chartPastel', 140);
-  addChartImage('chartLinea', 120);
+  const desglose = (obj) => Object.keys(obj).length
+    ? Object.entries(obj).map(([cat,total]) => `• ${cat}: ${money(total)}`).join('\n')
+    : '• (sin movimientos)';
 
-  // Tabla de movimientos del mes
-  const rows = monthMovs.map(m => [
-    fmtTime(m.ts), m.tipo==='ingreso'?'Ingreso':'Gasto', m.categoria||'', m.concepto||'',
-    (m.tipo==='ingreso'?'+':'−')+money(m.monto)
-  ]);
-  doc.autoTable({
-    startY: gy + 10,
-    head: [['Fecha','Tipo','Categoría','Concepto','Monto']],
-    body: rows.length?rows:[['—','—','—','Sin movimientos','—']],
-    theme:'striped',
-    headStyles:{ fillColor:dark, textColor:255, fontSize:10 },
-    bodyStyles:{ fontSize:9, textColor:40 },
-    alternateRowStyles:{ fillColor:[248,248,248] },
-    columnStyles:{ 4:{ halign:'right', fontStyle:'bold' } },
-    margin:{ left:40, right:40 },
-  });
+  return [
+    `*Finanzas Cerrada Mixcoac · ${label}*`,
+    '',
+    `💰 Cobrado: *${money(cobrado)}*`,
+    `💸 Gastos: *${money(gastos)}*`,
+    `🏦 En caja: *${money(cobrado - gastos)}*`,
+    '',
+    '*Ingresos por categoría:*',
+    desglose(porCategoriaIngreso),
+    '',
+    '*Gastos por categoría:*',
+    desglose(porCategoriaGasto),
+  ].join('\n');
+}
 
-  const fy = doc.lastAutoTable.finalY + 24;
-  doc.setFontSize(9); doc.setTextColor(150);
-  doc.text('Generado el '+new Date().toLocaleString('es-MX')+' · Cerrada Mixcoac', 40, fy);
+async function copiarParaWhatsApp(){
+  const btn = $('#waBtn'); const original = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(textoWhatsApp());
+    toast('Copiado — pégalo en WhatsApp', 'ok');
+    btn.textContent = '✅ Copiado';
+    setTimeout(()=>{ btn.textContent = original; }, 1800);
+  } catch(e){
+    console.error('copiarParaWhatsApp', e);
+    toast('No se pudo copiar', 'bad');
+  }
+}
 
-  doc.save(`Finanzas-Mixcoac-${label.replace(' ','-')}.pdf`);
+/* reporte PDF para el grupo de residentes */
+$('#pdfBtn').addEventListener('click', generarPDF);
+
+async function generarPDF(){
+  const btn = $('#pdfBtn'); const btnLabel = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit:'pt', format:'letter' });
+    const W = doc.internal.pageSize.getWidth();
+    const H = doc.internal.pageSize.getHeight();
+    const M = PDF.MARGIN;
+    const { label } = monthRange();
+
+    // finCache trae 6 meses; el reporte PDF es mensual, así que se filtra al mes en curso.
+    const curKey = finMonths.length ? finMonths[finMonths.length-1].key : monthKey(new Date());
+    const prevKey = finMonths.length > 1 ? finMonths[finMonths.length-2].key : null;
+    const monthMovs = finCache.filter(m => monthKey(m.ts) === curKey);
+
+    let cobrado = 0, gastos = 0;
+    monthMovs.forEach(m => m.tipo==='ingreso' ? cobrado += m.monto : gastos += m.monto);
+    const saldo = cobrado - gastos;
+
+    const byMonth = groupByMonth();
+    const prevMonth = prevKey ? byMonth[prevKey] : null;
+    const cmpPct = (cur, prevVal) => (prevVal > 0) ? Math.round(((cur - prevVal) / prevVal) * 100) : null;
+    const cmpCobrado = prevMonth ? cmpPct(cobrado, prevMonth.ingreso) : null;
+    const cmpGastos = prevMonth ? cmpPct(gastos, prevMonth.gasto) : null;
+    const prevSaldo = prevMonth ? (prevMonth.ingreso - prevMonth.gasto) : null;
+    const cmpSaldo = (prevMonth && prevSaldo !== 0) ? Math.round(((saldo - prevSaldo) / Math.abs(prevSaldo)) * 100) : null;
+
+    const folio = folioDelMes(curKey, cobrado, gastos);
+    const generadoEl = new Date().toLocaleString('es-MX', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+
+    /* ===== 1. Filete dorado + encabezado ===== */
+    doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
+
+    let y = M - 10;
+    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+    doc.text('E S T A D O   D E   C U E N T A   R E S I D E N C I A L', M, y + 14);
+
+    doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
+    doc.text('Cerrada Mixcoac', M, y + 42);
+
+    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+    doc.text(`Periodo: ${label}`, W - M, y + 10, { align:'right' });
+    doc.setTextColor(...PDF.notes);
+    doc.text(`Generado: ${generadoEl}`, W - M, y + 22, { align:'right' });
+    doc.text(`Folio: ${folio}`, W - M, y + 34, { align:'right' });
+
+    y += 58;
+    doc.setDrawColor(...PDF.grid);
+    doc.line(M, y, W - M, y);
+    y += 24;
+
+    /* ===== 2. Tres cajas de balance ===== */
+    const boxGap = 14, boxW = (W - 2*M - 2*boxGap) / 3, boxH = 68;
+    const boxes = [
+      { label:'TOTAL COBRADO', value: cobrado, color: PDF.green, cmp: cmpCobrado, higherIsBetter:true },
+      { label:'GASTOS', value: gastos, color: PDF.red, cmp: cmpGastos, higherIsBetter:false },
+      { label:'SALDO EN CAJA', value: saldo, color: PDF.navy, cmp: cmpSaldo, higherIsBetter:true },
+    ];
+    boxes.forEach((b, i) => {
+      const x = M + i*(boxW + boxGap);
+      doc.setDrawColor(...PDF.grid); doc.setFillColor(255,255,255);
+      doc.roundedRect(x, y, boxW, boxH, 6, 6, 'FD');
+      doc.setFont('helvetica','bold'); doc.setFontSize(8.5); doc.setTextColor(...PDF.secondary);
+      doc.text(b.label, x + 14, y + 20);
+      doc.setFont('courier','bold'); doc.setFontSize(16); doc.setTextColor(...b.color);
+      doc.text(money(b.value), x + boxW - 14, y + 44, { align:'right' });
+      if (b.cmp !== null){
+        const up = b.cmp >= 0;
+        const good = b.higherIsBetter ? up : !up;
+        doc.setFont('helvetica','bold'); doc.setFontSize(8);
+        doc.setTextColor(...(good ? PDF.green : PDF.red));
+        // ▲▼ evitados a propósito: los fuentes estándar de jsPDF (Helvetica WinAnsi) no
+        // los soportan y corrompen la codificación del texto completo. +/- sí es seguro.
+        doc.text(`${up?'+':'-'}${Math.abs(b.cmp)}% vs mes anterior`, x + 14, y + 58);
+      } else {
+        doc.setFont('helvetica','normal'); doc.setFontSize(8); doc.setTextColor(...PDF.notes);
+        doc.text('Sin datos del mes anterior', x + 14, y + 58);
+      }
+    });
+    y += boxH + 22;
+
+    /* ===== 3. Indicador de salud financiera ===== */
+    y = dibujarSaludFinanciera(doc, W, y, cobrado, gastos);
+    y += 10;
+
+    const tituloSeccion = (txt) => {
+      doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...PDF.text);
+      doc.text(txt, M, y + 12);
+      y += 20;
+    };
+
+    /* ===== 4. Barras Ingresos vs Gastos — solo meses con movimientos ===== */
+    tituloSeccion('Ingresos vs Gastos');
+    const { labels: barLabels, ingresos: barIngresos, gastos: barGastos } = mesesConMovimientos(byMonth);
+    const barImg = await renderBarrasHiRes(barLabels, barIngresos, barGastos);
+    const barBoxW = W - 2*M, barImgH = 140;
+    doc.setDrawColor(...PDF.grid); doc.setFillColor(255,255,255);
+    doc.roundedRect(M, y, barBoxW, barImgH + 16, 6, 6, 'FD');
+    doc.addImage(barImg, 'PNG', M + 8, y + 8, barBoxW - 16, barImgH);
+    y += barImgH + 16 + 12;
+    y = dibujarLeyendaSeries(doc, W, y, [{ label:'Ingresos', color:'#0f766e' }, { label:'Gastos', color:'#991b1b' }]);
+    y += 14;
+
+    /* ===== 5. Dona por categoría (izquierda) + desglose nativo (derecha), mayor a menor ===== */
+    tituloSeccion('Distribución de gastos por categoría');
+    const catRaw = categoriasDelMes(curKey);
+    const order = catRaw.labels.map((l,i)=>i).sort((a,b)=>catRaw.data[b]-catRaw.data[a]);
+    const pdfCatLabels = order.map(i=>catRaw.labels[i]);
+    const pdfCatData = order.map(i=>catRaw.data[i]);
+    const pdfCatHasData = catRaw.hasData;
+    const pastelImg = await renderPastelDoughnutHiRes(pdfCatLabels, pdfCatData, pdfCatHasData, money(gastos));
+    const donutSize = 150, donutX = M, donutY = y;
+    doc.addImage(pastelImg, 'PNG', donutX, donutY, donutSize, donutSize);
+    const legendX0 = donutX + donutSize + 24, legendX1 = W - M;
+    const legendEnd = dibujarLeyendaCategorias(doc, W, donutY + 6, pdfCatLabels, pdfCatData, pdfCatHasData, legendX0, legendX1);
+    y = Math.max(donutY + donutSize + 14, legendEnd) + 10;
+
+    /* ===== 6. Tabla "03 · Historial de transacciones" ===== */
+    doc.setFillColor(...PDF.gold); doc.rect(M, y, 20, 3, 'F');
+    doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...PDF.text);
+    doc.text('03 · Historial de transacciones', M + 28, y + 6);
+    y += 20;
+
+    const rows = monthMovs.map(m => ({
+      fecha: fmtTime(m.ts), tipo: m.tipo, categoria: m.categoria || 'Otro', concepto: m.concepto || '', monto: m.monto,
+    }));
+
+    doc.autoTable({
+      startY: y,
+      head: [['Fecha','Categoría','Concepto','Monto']],
+      body: rows.length
+        // "-" ASCII normal, no "−" (U+2212): ese signo no existe en WinAnsi/Helvetica estándar
+        // de jsPDF y corrompe toda la celda (mismo bug que las flechas ▲▼ de las cajas).
+        ? rows.map(r => [r.fecha, r.categoria, r.concepto, (r.tipo==='ingreso'?'+':'-') + money(r.monto)])
+        : [['—','—','Sin movimientos','—']],
+      foot: rows.length ? [['', '', 'Saldo del periodo', (saldo>=0?'+':'-') + money(Math.abs(saldo))]] : [],
+      theme:'plain',
+      styles:{ font:'helvetica', fontSize:9, textColor: PDF.text, cellPadding:6, lineColor: PDF.grid, lineWidth:0.5 },
+      headStyles:{ fillColor:[255,255,255], textColor: PDF.secondary, fontStyle:'bold', fontSize:8.5, lineColor: PDF.text },
+      alternateRowStyles:{ fillColor: PDF.zebra },
+      columnStyles:{ 3:{ halign:'right', font:'courier', fontStyle:'bold' } },
+      margin:{ left:M, right:M, bottom: 50 },
+      didParseCell(data){
+        if (data.section === 'body' && data.column.index === 1 && rows[data.row.index]){
+          data.cell.text = [''];
+        }
+        if (data.section === 'body' && data.column.index === 3 && rows[data.row.index]){
+          data.cell.styles.textColor = rows[data.row.index].tipo === 'ingreso' ? PDF.green : PDF.red;
+        }
+        if (data.section === 'foot'){
+          data.cell.styles.fontStyle = 'bold';
+          data.cell.styles.textColor = PDF.text;
+          if (data.column.index === 3){ data.cell.styles.font = 'courier'; data.cell.styles.halign = 'right'; }
+        }
+      },
+      didDrawCell(data){
+        if (data.section === 'body' && data.column.index === 1 && rows[data.row.index]){
+          const r = rows[data.row.index];
+          const ing = r.tipo === 'ingreso';
+          doc.setFont('helvetica','bold'); doc.setFontSize(8);
+          const textW = doc.getTextWidth(r.categoria);
+          const padX = 6, badgeW = textW + padX*2, badgeH = 14;
+          const bx = data.cell.x + 4, by = data.cell.y + (data.cell.height - badgeH) / 2;
+          doc.setFillColor(...(ing ? PDF.badgeGreenBg : PDF.badgeRedBg));
+          doc.roundedRect(bx, by, badgeW, badgeH, 3, 3, 'F');
+          doc.setTextColor(...(ing ? PDF.badgeGreenFg : PDF.badgeRedFg));
+          doc.text(r.categoria, bx + padX, by + badgeH/2 + 3);
+        }
+        if (data.section === 'foot' && data.row.index === 0 && data.column.index === 0){
+          doc.setDrawColor(...PDF.text); doc.setLineWidth(0.6);
+          doc.line(M, data.cell.y, W - M, data.cell.y);
+          doc.line(M, data.cell.y + 2, W - M, data.cell.y + 2);
+        }
+      },
+    });
+
+    /* ===== 7. Pie en todas las páginas =====
+       Folio + página van juntos a la derecha (no centrados) para no traslaparse con el texto
+       de la izquierda — con folio+fecha+"Reporte financiero oficial..." los tres textos
+       independientes no cabían en el ancho de la página. */
+    const totalPages = doc.internal.getNumberOfPages();
+    for (let p = 1; p <= totalPages; p++){
+      doc.setPage(p);
+      doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
+      doc.text('Reporte financiero oficial · Cerrada Mixcoac · Transparencia vecinal', M, H - 24);
+      doc.text(`${folio} · Página ${p} de ${totalPages}`, W - M, H - 24, { align:'right' });
+    }
+
+    doc.save(`Finanzas-Mixcoac-${label.replace(' ','-')}.pdf`);
+  } catch(e){
+    console.error('generarPDF', e);
+    toast('No se pudo generar el PDF', 'bad');
+  } finally {
+    btn.disabled = false; btn.textContent = btnLabel;
+  }
 }
 
 

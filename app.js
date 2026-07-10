@@ -848,61 +848,12 @@ async function saveMov(){
   finally { btn.disabled = false; btn.textContent = 'Guardar movimiento'; }
 }
 
-/* resumen del mes formateado para WhatsApp (negritas con asteriscos) */
-$('#waBtn').addEventListener('click', copiarParaWhatsApp);
-
-function textoWhatsApp(){
-  const { label } = monthRange();
-  const curKey = finMonths.length ? finMonths[finMonths.length-1].key : monthKey(new Date());
-  const monthMovs = finCache.filter(m => monthKey(m.ts) === curKey);
-
-  let cobrado = 0, gastos = 0;
-  const porCategoriaIngreso = {}, porCategoriaGasto = {};
-  monthMovs.forEach(m => {
-    const cat = m.categoria || 'Otro';
-    if (m.tipo === 'ingreso'){ cobrado += m.monto; porCategoriaIngreso[cat] = (porCategoriaIngreso[cat]||0) + m.monto; }
-    else { gastos += m.monto; porCategoriaGasto[cat] = (porCategoriaGasto[cat]||0) + m.monto; }
-  });
-
-  const desglose = (obj) => Object.keys(obj).length
-    ? Object.entries(obj).map(([cat,total]) => `• ${cat}: ${money(total)}`).join('\n')
-    : '• (sin movimientos)';
-
-  return [
-    `*Finanzas Cerrada Mixcoac · ${label}*`,
-    '',
-    `💰 Cobrado: *${money(cobrado)}*`,
-    `💸 Gastos: *${money(gastos)}*`,
-    `🏦 En caja: *${money(cobrado - gastos)}*`,
-    '',
-    '*Ingresos por categoría:*',
-    desglose(porCategoriaIngreso),
-    '',
-    '*Gastos por categoría:*',
-    desglose(porCategoriaGasto),
-  ].join('\n');
-}
-
-async function copiarParaWhatsApp(){
-  const btn = $('#waBtn'); const original = btn.textContent;
-  try {
-    await navigator.clipboard.writeText(textoWhatsApp());
-    toast('Copiado — pégalo en WhatsApp', 'ok');
-    btn.textContent = '✅ Copiado';
-    setTimeout(()=>{ btn.textContent = original; }, 1800);
-  } catch(e){
-    console.error('copiarParaWhatsApp', e);
-    toast('No se pudo copiar', 'bad');
-  }
-}
-
 /* reporte PDF para el grupo de residentes */
 $('#pdfBtn').addEventListener('click', generarPDF);
 
-async function generarPDF(){
-  const btn = $('#pdfBtn'); const btnLabel = btn.textContent;
-  btn.disabled = true; btn.textContent = 'Generando…';
-  try {
+/* construye el PDF premium (FASE 0) y devuelve {doc, filename} sin descargar ni compartir —
+   generarPDF() y compartirReportePDF() comparten esta misma construcción. */
+async function construirReportePDF(){
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit:'pt', format:'letter' });
     const W = doc.internal.pageSize.getWidth();
@@ -1088,7 +1039,16 @@ async function generarPDF(){
       doc.text(`${folio} · Página ${p} de ${totalPages}`, W - M, H - 24, { align:'right' });
     }
 
-    doc.save(`Finanzas-Mixcoac-${label.replace(' ','-')}.pdf`);
+    return { doc, filename: `Finanzas-Mixcoac-${label.replace(' ','-')}.pdf` };
+}
+
+/* botón "Reporte PDF": solo descarga */
+async function generarPDF(){
+  const btn = $('#pdfBtn'); const btnLabel = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    const { doc, filename } = await construirReportePDF();
+    doc.save(filename);
   } catch(e){
     console.error('generarPDF', e);
     toast('No se pudo generar el PDF', 'bad');
@@ -1097,6 +1057,37 @@ async function generarPDF(){
   }
 }
 
+/* botón "Compartir reporte": Web Share API nivel 2 (con archivo) para elegir WhatsApp directo
+   desde el panel nativo del celular; en escritorio o sin soporte, descarga y avisa.
+   Nada de awaits innecesarios entre terminar el PDF y llamar a navigator.share(): algunos
+   navegadores móviles invalidan el "gesto de usuario" si se demora demasiado o se anida mal. */
+async function compartirReportePDF(){
+  const btn = $('#waBtn'); const original = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    const { doc, filename } = await construirReportePDF();
+    const blob = doc.output('blob');
+    const file = new File([blob], filename, { type: 'application/pdf' });
+
+    if (navigator.canShare && navigator.canShare({ files: [file] })){
+      await navigator.share({ files: [file], title: 'Reporte financiero · Cerrada Mixcoac' });
+      toast('Reporte compartido', 'ok');
+    } else {
+      doc.save(filename);
+      toast('PDF descargado — adjúntalo en WhatsApp', 'ok');
+    }
+  } catch(e){
+    if (e && e.name === 'AbortError'){
+      // el usuario cerró el panel de compartir sin elegir nada; no es un error real.
+    } else {
+      console.error('compartirReportePDF', e);
+      toast('No se pudo generar el reporte', 'bad');
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = original;
+  }
+}
+$('#waBtn').addEventListener('click', compartirReportePDF);
 
 function openSheet(sel){ $(sel).classList.add('open'); }
 function closeSheet(sel){ $(sel).classList.remove('open'); }

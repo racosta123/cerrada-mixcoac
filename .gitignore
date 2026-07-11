@@ -3,3 +3,4 @@ demo-candado*.html
 *.zip
 files*.zip
 .wrangler/
+backups/

@@ -156,6 +156,17 @@
   .btn-ghost:active{transform:scale(.985)}
   .mov-amt{font-size:14px;font-weight:700;white-space:nowrap}
   .mov-amt.ok{color:var(--ok)} .mov-amt.bad{color:var(--bad)}
+  .fin-therm-box{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 15px;margin-bottom:14px}
+  .fin-therm-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:11px}
+  .fin-config{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .fin-config select, .fin-config input{padding:8px 10px;border-radius:9px;background:var(--surface-2);border:1px solid var(--line);color:var(--text);font-size:12px;font-family:inherit;width:auto}
+  .fin-config input{width:110px}
+  .therm-track{height:14px;border-radius:8px;background:var(--surface-2);border:1px solid var(--line);overflow:hidden}
+  .therm-fill{height:100%;width:0%;border-radius:8px;background:var(--muted-2);transition:width .3s ease}
+  .therm-fill.therm-bad{background:var(--bad)}
+  .therm-fill.therm-warn{background:var(--warn)}
+  .therm-fill.therm-ok{background:var(--ok)}
+  .therm-text{font-size:12.5px;color:var(--muted);margin-top:8px}
   .fin-charts{display:flex;flex-direction:column;gap:12px;margin:14px 0}
   .fin-chart-box{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 12px}
   .fin-chart-title{font-size:11px;color:var(--muted);letter-spacing:.3px;margin-bottom:10px;text-transform:uppercase}
@@ -319,7 +330,27 @@
         <div class="fin-cmp" id="cmpCaja"></div>
       </div>
     </div>
-    <div class="fin-charts">
+    <div class="fin-therm-box">
+      <div class="fin-therm-head">
+        <div class="section-title" style="margin:0">Termómetro de recaudación</div>
+        <div class="fin-config hidden" id="finConfigBox">
+          <select id="totalCasasSel">
+            <option value="50">50 casas</option>
+            <option value="100">100 casas</option>
+            <option value="150">150 casas</option>
+            <option value="200">200 casas</option>
+            <option value="250">250 casas</option>
+            <option value="300">300 casas</option>
+            <option value="otro">Otro…</option>
+          </select>
+          <input id="totalCasasCustom" type="number" min="1" class="hidden" placeholder="Cantidad exacta">
+          <button class="row-act" id="totalCasasSaveBtn">Guardar</button>
+        </div>
+      </div>
+      <div class="therm-track"><div class="therm-fill" id="thermFill"></div></div>
+      <div class="therm-text" id="thermText">Cargando…</div>
+    </div>
+    <div id="finCharts" class="fin-charts">
       <div class="fin-chart-box">
         <div class="fin-chart-title">Ingresos vs Gastos · 6 meses</div>
         <canvas id="chartBarras" height="180"></canvas>
@@ -327,25 +358,32 @@
       <div class="fin-chart-box">
         <div class="fin-chart-title">Gastos por categoría · este mes</div>
         <canvas id="chartPastel" height="180"></canvas>
+        <div id="chartPastelEmpty" class="empty hidden">Sin gastos este mes</div>
       </div>
       <div class="fin-chart-box">
         <div class="fin-chart-title">Saldo en caja · 6 meses</div>
         <canvas id="chartLinea" height="150"></canvas>
       </div>
     </div>
-    <div class="fin-actions">
+    <div id="finActionsMain" class="fin-actions">
       <button class="btn-primary" id="newMovBtn" style="margin-top:0">Registrar movimiento</button>
       <button class="btn-ghost" id="pdfBtn">Reporte PDF</button>
     </div>
-    <div class="fin-actions">
+    <div id="finActionsShare" class="fin-actions">
       <button class="btn-ghost" id="waBtn">📱 Compartir reporte</button>
     </div>
-    <div class="section-title">Movimientos</div>
-    <div class="fin-filters">
-      <select id="filtroCategoria"><option value="">Todas las categorías</option></select>
-      <select id="filtroMes"><option value="">Todos los meses</option></select>
+    <div id="morososSection">
+      <div class="section-title">Morosos del mes</div>
+      <div class="list" id="morososList"><div class="empty">Sin datos</div></div>
     </div>
-    <div class="list" id="movList"><div class="empty">Sin movimientos</div></div>
+    <div id="finDetalle">
+      <div class="section-title">Movimientos</div>
+      <div class="fin-filters">
+        <select id="filtroCategoria"><option value="">Todas las categorías</option></select>
+        <select id="filtroMes"><option value="">Todos los meses</option></select>
+      </div>
+      <div class="list" id="movList"><div class="empty">Sin movimientos</div></div>
+    </div>
   </div>
 
   <!-- TAB: ADMIN (master/admin) -->
@@ -431,6 +469,7 @@
         <option value="Otro">Otro</option>
       </select>
     </div>
+    <div class="field hidden" id="movCasaField"><label>Casa (obligatorio para cuotas)</label><input id="movCasa" placeholder="Ej. 57"></div>
     <div class="field"><label>Monto (MXN)</label><input id="movAmount" type="number" inputmode="decimal" placeholder="0.00"></div>
     <button class="btn-primary" id="saveMovBtn">Guardar movimiento</button>
     <div id="movErr" class="err"></div>

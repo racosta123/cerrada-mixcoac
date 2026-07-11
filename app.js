@@ -27,6 +27,8 @@ let ME = null;          // { uid, nombre, rol, casa, residenteUid? }
 let unsubLog = null;
 let unsubInvites = null;
 let unsubFin = null;
+let unsubConfig = null;
+let CONFIG_GENERAL = { totalCasas: null };
 
 /* ====================== UTILIDADES ====================== */
 const $ = s => document.querySelector(s);
@@ -466,23 +468,155 @@ const monthKey = ts => { const d = ts.toDate ? ts.toDate() : new Date(ts); retur
 
 function watchFinanzas(){
   if (unsubFin) unsubFin();
+  if (unsubConfig) unsubConfig();
   const isStaff = (ME.rol==='master' || ME.rol==='admin');
-  // Solo staff registra; residentes/esclavos ven en modo lectura.
+
+  // Detalle de movimientos, gráficas, morosos y config de casas: solo staff.
+  // Residentes/esclavos ya no leen "finanzas" directo (bloqueado por Firestore
+  // rules) — reciben solo el agregado del Worker, nunca el detalle por casa.
   $('#newMovBtn').style.display = isStaff ? 'block' : 'none';
+  $('#finCharts').classList.toggle('hidden', !isStaff);
+  $('#finActionsMain').classList.toggle('hidden', !isStaff);
+  $('#finActionsShare').classList.toggle('hidden', !isStaff);
+  $('#morososSection').classList.toggle('hidden', !isStaff);
+  $('#finDetalle').classList.toggle('hidden', !isStaff);
+  $('#finConfigBox').classList.toggle('hidden', !isStaff);
 
   finMonths = last6Months();
   const { label } = monthRange();
   $('#finMonth').textContent = 'Finanzas · ' + label;
 
-  unsubFin = db.collection('finanzas')
-    .where('ts','>=',finMonths[0].start)
-    .orderBy('ts','desc').limit(1200)
-    .onSnapshot(snap => {
-      finCache = [];
-      snap.forEach(doc => finCache.push(doc.data()));
-      renderFinanzas();
-    }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
+  if (isStaff){
+    unsubFin = db.collection('finanzas')
+      .where('ts','>=',finMonths[0].start)
+      .orderBy('ts','desc').limit(1200)
+      .onSnapshot(snap => {
+        finCache = [];
+        snap.forEach(doc => finCache.push(doc.data()));
+        renderFinanzas();
+      }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
+
+    unsubConfig = db.collection('config').doc('general').onSnapshot(doc => {
+      CONFIG_GENERAL = doc.exists ? doc.data() : { totalCasas: null };
+      renderConfigCasas();
+      renderTermometro(pagaronDelMes(), CONFIG_GENERAL.totalCasas);
+      renderMorosos();
+    }, err => console.error(err));
+  } else {
+    loadResumenResidente();
+  }
 }
+
+/* -------- resumen agregado para residentes/esclavos (vía Worker) -------- */
+async function loadResumenResidente(){
+  try {
+    const r = await authedFetch('/finanzas/resumen', {});
+    $('#finCobrado').textContent = money(r.ingreso);
+    $('#finGastos').textContent = money(r.egreso);
+    $('#finCaja').textContent = money(r.balance);
+    renderTermometro(r.pagaron, r.totalCasas);
+  } catch(e){
+    console.error(e);
+    $('#thermText').textContent = 'No se pudo cargar la información financiera.';
+  }
+}
+
+/* -------- termómetro "X de Y casas pagaron" (compartido staff/residente) -------- */
+function renderTermometro(pagaron, totalCasas){
+  const fill = $('#thermFill');
+  if (!totalCasas){
+    fill.style.width = '0%';
+    fill.className = 'therm-fill';
+    const isStaff = (ME.rol==='master' || ME.rol==='admin');
+    $('#thermText').textContent = isStaff
+      ? 'Configura el número de casas (arriba) para activar el termómetro.'
+      : 'El termómetro aún no está configurado.';
+    return;
+  }
+  const pct = Math.round((pagaron / totalCasas) * 100);
+  const color = pct >= 80 ? 'ok' : pct >= 50 ? 'warn' : 'bad';
+  fill.style.width = Math.min(pct, 100) + '%';
+  fill.className = 'therm-fill therm-' + color;
+  $('#thermText').textContent = `${pagaron} de ${totalCasas} casas pagaron (${pct}%)`;
+}
+
+/* -------- casas únicas que ya pagaron Cuota este mes (solo staff, desde finCache) -------- */
+function pagaronDelMes(){
+  const curKey = monthKey(new Date());
+  const set = new Set();
+  finCache.forEach(m => {
+    if (m.tipo==='ingreso' && (m.categoria||'')==='Cuota' && monthKey(m.ts)===curKey && m.casa) {
+      set.add(normalizarCasa(m.casa));
+    }
+  });
+  return set.size;
+}
+
+/* -------- lista de morosos del mes (solo staff) -------- */
+function renderMorosos(){
+  const list = $('#morososList');
+  const totalCasas = CONFIG_GENERAL.totalCasas;
+  if (!totalCasas){ list.innerHTML = '<div class="empty">Configura el número de casas para ver esta lista</div>'; return; }
+
+  const curKey = monthKey(new Date());
+  const pagaronSet = new Set();
+  finCache.forEach(m => {
+    if (m.tipo==='ingreso' && (m.categoria||'')==='Cuota' && monthKey(m.ts)===curKey && m.casa) {
+      pagaronSet.add(normalizarCasa(m.casa));
+    }
+  });
+
+  const casasValidas = Array.from({length: totalCasas}, (_,i) => String(i+1));
+  const morosos = casasValidas.filter(c => !pagaronSet.has(c));
+  const noReconocidos = [...pagaronSet].filter(c => !casasValidas.includes(c));
+
+  if (!morosos.length && !noReconocidos.length){ list.innerHTML = '<div class="empty">Todas las casas están al corriente</div>'; return; }
+
+  let html = morosos.map(c => `
+    <div class="row"><div class="rt"><div class="a">Casa ${esc(c)}</div></div><span class="tag out">Sin pago</span></div>`).join('');
+  if (noReconocidos.length){
+    html += `<div class="section-title" style="margin-top:14px;font-size:12px">No reconocidos (fuera de 1–${totalCasas})</div>` +
+      noReconocidos.map(c => `<div class="row"><div class="rt"><div class="a">${esc(c)}</div></div><span class="tag">Revisar</span></div>`).join('');
+  }
+  list.innerHTML = html;
+}
+
+/* -------- config de número de casas (solo staff) -------- */
+const TOTAL_CASAS_PRESETS = ['50','100','150','200','250','300'];
+function renderConfigCasas(){
+  const sel = $('#totalCasasSel');
+  const custom = $('#totalCasasCustom');
+  const val = CONFIG_GENERAL.totalCasas;
+  if (val && TOTAL_CASAS_PRESETS.includes(String(val))){
+    sel.value = String(val);
+    custom.classList.add('hidden');
+  } else if (val) {
+    sel.value = 'otro';
+    custom.value = val;
+    custom.classList.remove('hidden');
+  } else {
+    sel.value = '100';
+    custom.classList.add('hidden');
+  }
+}
+$('#totalCasasSel').addEventListener('change', () => {
+  $('#totalCasasCustom').classList.toggle('hidden', $('#totalCasasSel').value !== 'otro');
+});
+$('#totalCasasSaveBtn').addEventListener('click', async () => {
+  const sel = $('#totalCasasSel').value;
+  const n = sel === 'otro' ? parseInt($('#totalCasasCustom').value, 10) : parseInt(sel, 10);
+  if (!Number.isInteger(n) || n <= 0) { toast('Número de casas inválido', 'bad'); return; }
+  const btn = $('#totalCasasSaveBtn'); btn.disabled = true;
+  try {
+    await authedFetch('/config/actualizar', { totalCasas: n });
+    toast('Número de casas actualizado', 'ok');
+  } catch(e){
+    console.error(e);
+    toast('No se pudo guardar, intenta más tarde', 'bad');
+    renderConfigCasas(); // regresa el dropdown al valor real de Firestore
+  }
+  finally { btn.disabled = false; }
+});
 
 function groupByMonth(){
   const map = {};
@@ -524,6 +658,8 @@ function renderFinanzas(){
   renderFinCharts(byMonth, curKey);
   populateFiltros();
   filterAndRenderMovs();
+  renderTermometro(pagaronDelMes(), CONFIG_GENERAL.totalCasas);
+  renderMorosos();
 }
 
 /* -------- gastos por categoría del mes (compartido: dashboard + PDF) -------- */
@@ -535,8 +671,8 @@ function categoriasDelMes(curKey){
   });
   const labels = Object.keys(catTotals);
   return {
-    labels: labels.length ? labels : ['Sin gastos'],
-    data: labels.length ? labels.map(c=>catTotals[c]) : [1],
+    labels,
+    data: labels.map(c=>catTotals[c]),
     hasData: labels.length > 0,
   };
 }
@@ -576,18 +712,22 @@ function renderFinCharts(byMonth, curKey){
   const { labels: catLabels, data: catData, hasData } = categoriasDelMes(curKey);
   const palette = [gold, goldSoft, ok, bad, muted, '#9c7d1e', '#3b82f6'];
 
-  if (finCharts.pastel) finCharts.pastel.destroy();
-  finCharts.pastel = new Chart($('#chartPastel'), {
-    type:'pie',
-    data:{
-      labels: catLabels,
-      datasets:[{
-        data: catData,
-        backgroundColor: hasData ? catLabels.map((_,i)=>palette[i%palette.length]) : [line],
-      }],
-    },
-    options:{ responsive:true, plugins:{ legend:{ position:'bottom', labels:{ color:text, boxWidth:12 } } } }
-  });
+  if (finCharts.pastel){ finCharts.pastel.destroy(); finCharts.pastel = null; }
+  $('#chartPastel').classList.toggle('hidden', !hasData);
+  $('#chartPastelEmpty').classList.toggle('hidden', hasData);
+  if (hasData){
+    finCharts.pastel = new Chart($('#chartPastel'), {
+      type:'doughnut',
+      data:{
+        labels: catLabels,
+        datasets:[{
+          data: catData,
+          backgroundColor: catLabels.map((_,i)=>palette[i%palette.length]),
+        }],
+      },
+      options:{ responsive:true, cutout:'55%', plugins:{ legend:{ position:'bottom', labels:{ color:text, boxWidth:12 } } } }
+    });
+  }
 
   if (finCharts.linea) finCharts.linea.destroy();
   finCharts.linea = new Chart($('#chartLinea'), {
@@ -673,6 +813,8 @@ function dibujarLeyendaSeries(doc, W, gy, items){
    imagen — esas van como texto nativo del PDF (ver dibujarLeyendaCategorias), para que queden
    nítidas a cualquier zoom en vez de pixeleadas dentro de un PNG. */
 async function renderPastelDoughnutHiRes(catLabels, catData, hasData, totalTexto){
+  // sin gastos: anillo gris de relleno solo dentro de esta imagen (el dato falso no sale de aquí)
+  if (!hasData){ catLabels = ['Sin gastos']; catData = [1]; }
   const SIZE = 900; // px reales del canvas (cuadrado, > 800 mínimo pedido)
   const off = document.createElement('canvas');
   off.width = SIZE; off.height = SIZE;
@@ -783,10 +925,14 @@ function dibujarSaludFinanciera(doc, W, gy, cobrado, gastos){
 }
 
 /* -------- filtros (100% client-side sobre finCache) -------- */
+// Las 8 categorías fijas siempre visibles en el filtro (mismo orden que el <select> de registro).
+const CATEGORIAS_FIJAS = ['Cuota','Multa','Mantenimiento','Seguridad','Limpieza','Mejoras','Servicios','Otro'];
 function populateFiltros(){
   const selCat = $('#filtroCategoria');
   const curCat = selCat.value;
-  const cats = [...new Set(finCache.map(m=>m.categoria||'Otro'))].sort();
+  // Fijas primero; si algún movimiento viejo trae una categoría fuera de la lista, se agrega al final.
+  const extras = [...new Set(finCache.map(m=>m.categoria||'Otro'))].filter(c=>!CATEGORIAS_FIJAS.includes(c)).sort();
+  const cats = [...CATEGORIAS_FIJAS, ...extras];
   selCat.innerHTML = '<option value="">Todas las categorías</option>' + cats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
   selCat.value = cats.includes(curCat) ? curCat : '';
 
@@ -822,28 +968,37 @@ function renderMovs(movs){
 }
 
 /* registrar movimiento (solo staff) */
-$('#newMovBtn').addEventListener('click', ()=>{ $('#movErr').textContent=''; openSheet('#movOverlay'); });
+const normalizarCasa = s => String(s||'').trim().replace(/\s+/g,' ');
+function casaRequerida(){ return movType==='ingreso' && $('#movCat').value==='Cuota'; }
+function updateCasaField(){
+  $('#movCasaField').classList.toggle('hidden', !casaRequerida());
+}
+$('#newMovBtn').addEventListener('click', ()=>{ $('#movErr').textContent=''; updateCasaField(); openSheet('#movOverlay'); });
 $('#movOverlay').addEventListener('click', e => { if(e.target.id==='movOverlay') closeSheet('#movOverlay'); });
 $('#movTypeSeg').addEventListener('click', e => {
   const b = e.target.closest('button'); if(!b) return;
   $$('#movTypeSeg button').forEach(x=>x.classList.remove('sel'));
   b.classList.add('sel'); movType = b.dataset.t;
+  updateCasaField();
 });
+$('#movCat').addEventListener('change', updateCasaField);
 $('#saveMovBtn').addEventListener('click', saveMov);
 
 async function saveMov(){
   const concepto = $('#movConcept').value.trim();
   const categoria = $('#movCat').value.trim() || 'Otro';
   const monto = parseFloat($('#movAmount').value);
+  const casa = normalizarCasa($('#movCasa').value);
   $('#movErr').textContent = '';
   if (!concepto || !(monto > 0)){ $('#movErr').textContent = 'Falta concepto o monto válido'; return; }
+  if (casaRequerida() && !casa){ $('#movErr').textContent = 'Falta el número de casa (obligatorio para cuotas)'; return; }
   const btn = $('#saveMovBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
     // El movimiento lo escribe el Worker tras verificar rol master/admin.
-    await authedFetch('/finanzas/registrar', { tipo: movType, concepto, categoria, monto });
+    await authedFetch('/finanzas/registrar', { tipo: movType, concepto, categoria, monto, casa });
     toast('Movimiento registrado', 'ok');
     closeSheet('#movOverlay');
-    $('#movConcept').value = $('#movCat').value = $('#movAmount').value = '';
+    $('#movConcept').value = $('#movCat').value = $('#movAmount').value = $('#movCasa').value = '';
   } catch(e){ $('#movErr').textContent = e.message || 'No se pudo guardar'; }
   finally { btn.disabled = false; btn.textContent = 'Guardar movimiento'; }
 }

@@ -4,3 +4,5 @@ demo-candado*.html
 files*.zip
 .wrangler/
 backups/
+run-with-sa.js
+.claude/

@@ -43,9 +43,21 @@ service cloud.firestore {
     }
     // ---- finanzas ----
     match /finanzas/{id} {
-      // todos los usuarios autenticados ven los movimientos (residentes en lectura)
-      allow read: if signedIn();
+      // Solo staff lee el detalle de movimientos (incluye el campo "casa" por cuota).
+      // Residentes/esclavos ya NO leen esta colección directo — reciben solo agregados
+      // vía el Worker (endpoint /finanzas/resumen), para que no puedan reconstruir
+      // la lista de morosos con las devtools aunque la UI la oculte.
+      allow read: if signedIn() && staff();
       // los movimientos SOLO los escribe el Worker tras verificar rol master/admin
+      allow write: if false;
+    }
+
+    // ---- config (ej. config/general → totalCasas) ----
+    match /config/{id} {
+      // Solo staff necesita leer la config directo; residentes la reciben ya
+      // incorporada en el agregado de /finanzas/resumen.
+      allow read: if signedIn() && staff();
+      // SOLO el Worker escribe (tras verificar rol master/admin)
       allow write: if false;
     }
   }

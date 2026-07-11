@@ -42,6 +42,8 @@ export default {
         case '/invitacion/crear':  out = await crearInvitacion(req, env); break;
         case '/validar-qr':        out = await validarQR(req, env); break;  // lo llama el lector físico
         case '/finanzas/registrar': out = await registrarFinanza(req, env); break;
+        case '/finanzas/resumen':  out = await resumenFinanzas(req, env); break;
+        case '/config/actualizar': out = await actualizarConfig(req, env); break;
         case '/usuarios/crear':    out = await crearUsuario(req, env); break;
         case '/usuarios/suspender': out = await suspenderUsuario(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
@@ -167,28 +169,94 @@ async function suspenderUsuario(req, env) {
   return json({ ok:true, uid, suspendido });
 }
 
+// Trim + colapsa espacios dobles/múltiples a uno solo (no prohíbe espacios internos,
+// solo normaliza — así "casa  57" y "casa 57" terminan guardados igual).
+function normalizarCasa(s) {
+  return String(s || '').trim().replace(/\s+/g, ' ');
+}
+
 /* ============ /finanzas/registrar — solo master/admin ============ */
 async function registrarFinanza(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
   if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo master/admin registran finanzas');
 
-  const { tipo, concepto, categoria, monto } = await req.json();
+  const { tipo, concepto, categoria, monto, casa } = await req.json();
   if (!['ingreso','egreso'].includes(tipo)) throw httpErr(400, 'Tipo inválido');
   const m = Number(monto);
   if (!concepto || !(m > 0)) throw httpErr(400, 'Concepto o monto inválido');
+
+  const cat = String(categoria||'Otro').slice(0,40);
+  const casaNorm = normalizarCasa(casa).slice(0,40);
+  // El campo Casa es obligatorio SOLO para cuotas de ingreso — es la llave que
+  // alimenta el termómetro de recaudación y la lista de morosos.
+  if (tipo === 'ingreso' && cat === 'Cuota' && !casaNorm) {
+    throw httpErr(400, 'Falta el número/identificador de casa para una cuota');
+  }
 
   const id = crypto.randomUUID();
   await firestoreSet(env, `finanzas/${id}`, {
     tipo:{stringValue:tipo},
     concepto:{stringValue:String(concepto).slice(0,120)},
-    categoria:{stringValue:String(categoria||'Otro').slice(0,40)},
+    categoria:{stringValue:cat},
     monto:{doubleValue:m},
+    casa:{stringValue:casaNorm},
     creadoPor:{stringValue:user.uid},
     creadoNombre:{stringValue:perfil.nombre||''},
     ts:{timestampValue:new Date().toISOString()},
   });
   return json({ ok:true, id });
+}
+
+/* ============ /config/actualizar — solo master/admin ============ */
+async function actualizarConfig(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo master/admin configuran');
+
+  const { totalCasas } = await req.json();
+  const n = Number(totalCasas);
+  if (!Number.isInteger(n) || n <= 0) throw httpErr(400, 'totalCasas debe ser un entero positivo');
+
+  await firestoreSet(env, 'config/general', {
+    totalCasas:{integerValue:n},
+  });
+  return json({ ok:true, totalCasas:n });
+}
+
+/* ============ /finanzas/resumen — cualquier usuario autenticado ============
+   Devuelve SOLO agregados del mes en curso (cobrado, gastos, balance, y el
+   termómetro X de Y casas pagaron) — nunca el detalle de movimientos ni qué
+   casa específica pagó. Así el dashboard de residentes no necesita leer
+   "finanzas" directo (las reglas de Firestore ya se lo bloquean). */
+async function resumenFinanzas(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil) throw httpErr(403, 'Sin perfil');
+
+  const now = new Date();
+  const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1);
+  const finMes = new Date(now.getFullYear(), now.getMonth()+1, 1);
+
+  const docs = await firestoreList(env, 'finanzas');
+  let ingreso = 0, egreso = 0;
+  const pagaron = new Set();
+  for (const doc of docs) {
+    const d = readDoc(doc.fields);
+    const ts = new Date(d.ts);
+    if (!(ts >= inicioMes && ts < finMes)) continue;
+    if (d.tipo === 'ingreso') ingreso += d.monto || 0;
+    else if (d.tipo === 'egreso') egreso += d.monto || 0;
+    if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa) pagaron.add(d.casa);
+  }
+
+  const config = await getConfigGeneral(env);
+
+  return json({
+    ingreso, egreso, balance: ingreso - egreso,
+    pagaron: pagaron.size,
+    totalCasas: config?.totalCasas ?? null,
+  });
 }
 
 /* ============ /usuarios/crear — solo staff, vía Admin ============ */
@@ -318,6 +386,30 @@ async function getPerfil(env, uid) {
   if (!r.ok) return null;
   const d = await r.json();
   return readDoc(d.fields);
+}
+async function getConfigGeneral(env) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const r = await fetch(`${fsBase(env)}/config/general`, { headers:{ Authorization:'Bearer '+at } });
+  if (!r.ok) return null;
+  const d = await r.json();
+  return readDoc(d.fields);
+}
+/* Lista completa de una colección (paginada) — usada por /finanzas/resumen. */
+async function firestoreList(env, coleccion) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const docs = [];
+  let pageToken;
+  do {
+    const url = new URL(`${fsBase(env)}/${coleccion}`);
+    url.searchParams.set('pageSize', '300');
+    if (pageToken) url.searchParams.set('pageToken', pageToken);
+    const r = await fetch(url, { headers:{ Authorization:'Bearer '+at } });
+    if (!r.ok) throw httpErr(500, 'Firestore list falló');
+    const d = await r.json();
+    (d.documents||[]).forEach(doc => docs.push(doc));
+    pageToken = d.nextPageToken;
+  } while (pageToken);
+  return docs;
 }
 async function getInvitacion(env, jti) {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');

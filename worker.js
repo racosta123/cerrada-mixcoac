@@ -49,8 +49,12 @@ export default {
         case '/vecinos/actualizar': out = await actualizarVecino(req, env); break;
         case '/vecinos/borrar':    out = await borrarVecino(req, env); break;
         case '/vecinos/listar':    out = await listarVecinos(req, env); break;
+        case '/invitaciones/crear':    out = await crearInvitacionRegistro(req, env); break;
+        case '/invitaciones/validar':  out = await validarInvitacionRegistro(req, env); break;
+        case '/invitaciones/completar': out = await completarInvitacionRegistro(req, env); break;
         case '/usuarios/crear':    out = await crearUsuario(req, env); break;
         case '/usuarios/suspender': out = await suspenderUsuario(req, env); break;
+        case '/usuarios/borrar':   out = await borrarUsuario(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -172,6 +176,65 @@ async function suspenderUsuario(req, env) {
     suspendido: { booleanValue: suspendido },
   }, ['suspendido']);
   return json({ ok:true, uid, suspendido });
+}
+
+/* ============ /usuarios/borrar — SOLO master ============
+   Borra la cuenta de Firebase Auth + su doc /usuarios, y limpia el uid del vecino
+   vinculado (uid→null) para que se pueda reinvitar. Respaldo a usuarios_borrados y
+   registro en bitácora. No permite borrarse a sí mismo ni a otra cuenta master. */
+async function borrarUsuario(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master borra cuentas');
+
+  const { uid } = await req.json();
+  if (!uid || typeof uid !== 'string' || uid.length < 6 || uid.length > 128) throw httpErr(400, 'uid inválido');
+  if (uid === user.uid) throw httpErr(409, 'No puedes borrar tu propia cuenta');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/identitytoolkit https://www.googleapis.com/auth/datastore');
+
+  // Snapshot del doc /usuarios para el respaldo.
+  const rGet = await fetch(`${fsBase(env)}/usuarios/${uid}`, { headers:{ Authorization:'Bearer '+at } });
+  const usuarioDoc = rGet.ok ? await rGet.json() : null;
+  const objetivo = usuarioDoc ? readDoc(usuarioDoc.fields) : {};
+  if (objetivo.rol === 'master') throw httpErr(403, 'No se puede borrar una cuenta master');
+
+  // Respaldo (quién/cuándo/snapshot completo).
+  await firestoreSet(env, `usuarios_borrados/${uid}`, {
+    ...(usuarioDoc?.fields || {}),
+    borradoPor:{stringValue:user.uid},
+    borradoNombre:{stringValue:perfil.nombre||''},
+    borradoTs:{timestampValue:new Date().toISOString()},
+  }, at);
+
+  // Borra la cuenta de Firebase Auth. Si ya no existe (USER_NOT_FOUND), sigue limpiando.
+  const rDel = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts:delete`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ localId: uid }),
+  });
+  if (!rDel.ok) {
+    const err = await rDel.json().catch(() => ({}));
+    if (!String(err.error?.message || '').includes('USER_NOT_FOUND')) throw httpErr(500, 'No se pudo borrar la cuenta de Auth');
+  }
+
+  // Borra el doc /usuarios/{uid}.
+  await fetch(`${fsBase(env)}/usuarios/${uid}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+
+  // Limpia el uid del vecino vinculado (→ null) para poder reinvitar ese domicilio.
+  let domicilioLiberado = null;
+  const vinc = (await firestoreList(env, 'vecinos')).find(d => readDoc(d.fields).uid === uid);
+  if (vinc) {
+    const vid = vinc.name.split('/').pop();
+    domicilioLiberado = readDoc(vinc.fields).domicilio || null;
+    await firestoreActualizarCampos(env, `vecinos/${vid}`, { uid:{nullValue:null} }, 'Vecino');
+  }
+
+  await logBitacora(env, at, {
+    uid: user.uid,
+    nombre: `${perfil.nombre || 'Master'} borró la cuenta de ${objetivo.nombre || objetivo.email || uid}`,
+  });
+
+  return json({ ok:true, uid, domicilioLiberado });
 }
 
 // Trim + colapsa espacios dobles/múltiples a uno solo (no prohíbe espacios internos,
@@ -484,6 +547,161 @@ async function logBitacora(env, at, { uid, nombre }) {
       ts:{timestampValue:new Date().toISOString()},
     }}),
   });
+}
+
+/* ===========================================================
+   INVITACIONES DE REGISTRO (FASE 6) — vincular vecino → cuenta de login
+   Colección registro_invitaciones/{hashToken} (SEPARADA de los QR de visita, que
+   viven en /invitaciones). El token en claro NUNCA se guarda ni se genera en el
+   frontend: solo su hash SHA-256, que además es el id del doc → lookup O(1) por hash,
+   sin enumerar. El token viaja solo en el fragmento del link.
+   =========================================================== */
+
+async function sha256b64url(str) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return bytesToB64url(new Uint8Array(digest));
+}
+/* Igualdad en tiempo constante: no corta en el primer byte distinto. */
+function timingSafeEqual(a, b) {
+  const ba = new TextEncoder().encode(a), bb = new TextEncoder().encode(b);
+  if (ba.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ba.length; i++) diff |= ba[i] ^ bb[i];
+  return diff === 0;
+}
+
+/* Lee y valida una invitación por su token. Devuelve { x, updateTime, hash } o null.
+   Validación POR HASH y en tiempo constante — nunca por igualdad del token en claro. */
+async function leerInvitacionValida(env, at, token) {
+  const hash = await sha256b64url(String(token || ''));
+  const r = await fetch(`${fsBase(env)}/registro_invitaciones/${hash}`, { headers:{ Authorization:'Bearer '+at } });
+  if (!r.ok) return null;
+  const doc = await r.json();
+  const x = readDoc(doc.fields);
+  if (!x || !timingSafeEqual(x.hashToken || '', hash)) return null;
+  if (x.usado) return null;
+  if (!x.expiraEn || new Date(x.expiraEn) < new Date()) return null;
+  return { x, updateTime: doc.updateTime, hash };
+}
+
+/* /invitaciones/crear — SOLO staff. Token de un uso para que un vecino ACTIVO y SIN
+   cuenta se registre. Invalida invitaciones previas no usadas del mismo vecino (solo
+   una viva a la vez). Devuelve el token en claro UNA sola vez. */
+async function crearInvitacionRegistro(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff genera invitaciones');
+
+  const { vecinoId } = await req.json();
+  if (!vecinoId || !/^[A-Za-z0-9-]{10,64}$/.test(vecinoId)) throw httpErr(400, 'vecinoId inválido');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const rGet = await fetch(`${fsBase(env)}/vecinos/${vecinoId}`, { headers:{ Authorization:'Bearer '+at } });
+  if (rGet.status === 404) throw httpErr(404, 'Vecino no existe');
+  if (!rGet.ok) throw httpErr(500, 'Firestore get falló');
+  const vecino = readDoc((await rGet.json()).fields);
+  if ((vecino.estado || 'activo') !== 'activo') throw httpErr(409, 'El vecino no está activo');
+  if (vecino.uid) throw httpErr(409, 'El vecino ya tiene una cuenta vinculada');
+
+  // Solo una invitación viva a la vez: borra las previas no usadas de este vecino.
+  const previas = (await firestoreList(env, 'registro_invitaciones'))
+    .filter(d => { const x = readDoc(d.fields); return x.vecinoId === vecinoId && !x.usado; });
+  for (const d of previas) {
+    const pid = d.name.split('/').pop();
+    await fetch(`${fsBase(env)}/registro_invitaciones/${pid}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  }
+
+  // Token aleatorio de 32 bytes (256 bits). Solo su hash se persiste (como id del doc).
+  const token = bytesToB64url(crypto.getRandomValues(new Uint8Array(32)));
+  const hash = await sha256b64url(token);
+  const expiraEn = new Date(Date.now() + 72 * 3600 * 1000).toISOString();
+
+  await firestoreSet(env, `registro_invitaciones/${hash}`, {
+    hashToken:{stringValue:hash},
+    vecinoId:{stringValue:vecinoId},
+    domicilio:{stringValue:vecino.domicilio || ''},
+    nombre:{stringValue:vecino.nombre || ''},
+    creadoPor:{stringValue:user.uid},
+    creadoEn:{timestampValue:new Date().toISOString()},
+    expiraEn:{timestampValue:expiraEn},
+    usado:{booleanValue:false},
+    usadoEn:{nullValue:null},
+  }, at);
+
+  return json({ ok:true, token, expiraEn });
+}
+
+/* /invitaciones/validar — PÚBLICO (token-gated). Solo revela nombre + domicilio.
+   Error genérico si no sirve (sin decir si fue inexistente/usada/vencida). */
+async function validarInvitacionRegistro(req, env) {
+  const { token } = await req.json();
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const inv = await leerInvitacionValida(env, at, token);
+  if (!inv) throw httpErr(400, 'Invitación inválida o expirada');
+  return json({ ok:true, nombre: inv.x.nombre || '', domicilio: inv.x.domicilio || '' });
+}
+
+/* /invitaciones/completar — PÚBLICO. Crea la cuenta del residente. QUEMA-PRIMERO:
+   CAS atómico usado:false→true por precondición de updateTime; si gana la carrera crea
+   la cuenta y escribe el uid; si la creación falla (p.ej. correo ya existe) revierte el
+   token a usado:false. rol/casa/nombre los pone el Worker desde el doc del vecino —
+   NUNCA del payload del cliente. */
+async function completarInvitacionRegistro(req, env) {
+  const { token, email, password } = await req.json();
+  const correo = String(email || '').trim();
+  const pass = String(password || '');
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(correo)) throw httpErr(400, 'Correo inválido');
+  if (pass.length < 8) throw httpErr(400, 'La contraseña debe tener al menos 8 caracteres');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/identitytoolkit https://www.googleapis.com/auth/datastore');
+  const inv = await leerInvitacionValida(env, at, token);
+  if (!inv) throw httpErr(400, 'Invitación inválida o expirada');
+
+  // 1) QUEMA-PRIMERO con compare-and-set (precondición updateTime). Un 412 = otro request
+  //    ya lo quemó en la carrera → un solo uso garantizado.
+  const burnUrl = `${fsBase(env)}/registro_invitaciones/${inv.hash}`
+    + `?updateMask.fieldPaths=usado&updateMask.fieldPaths=usadoEn`
+    + `&currentDocument.updateTime=${encodeURIComponent(inv.updateTime)}`;
+  const rBurn = await fetch(burnUrl, {
+    method:'PATCH', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ fields:{ usado:{booleanValue:true}, usadoEn:{timestampValue:new Date().toISOString()} } }),
+  });
+  if (rBurn.status === 412 || rBurn.status === 409) throw httpErr(409, 'Esta invitación ya fue usada');
+  if (!rBurn.ok) throw httpErr(500, 'No se pudo procesar la invitación');
+
+  const revertirQuemado = async () => {
+    await fetch(`${fsBase(env)}/registro_invitaciones/${inv.hash}?updateMask.fieldPaths=usado&updateMask.fieldPaths=usadoEn`, {
+      method:'PATCH', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+      body: JSON.stringify({ fields:{ usado:{booleanValue:false}, usadoEn:{nullValue:null} } }),
+    }).catch(()=>{});
+  };
+
+  // 2) Crear la cuenta de Auth. Si el correo ya existe, se revierte el quemado (no se
+  //    consume el token) y se avisa claro.
+  const res = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ email: correo, password: pass, displayName: inv.x.nombre || '', emailVerified:false }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    await revertirQuemado();
+    if (String(err.error?.message || '').startsWith('EMAIL_EXISTS')) {
+      throw httpErr(409, 'Ese correo ya está registrado. Usa otro o inicia sesión con él.');
+    }
+    throw httpErr(400, 'No se pudo crear la cuenta');
+  }
+  const { localId } = await res.json();
+
+  // 3) Perfil de login (rol/casa desde el vecino) + vínculo uid en el doc del vecino.
+  await firestoreSet(env, `usuarios/${localId}`, {
+    nombre:{stringValue: inv.x.nombre || ''},
+    email:{stringValue: correo},
+    rol:{stringValue:'residente'},
+    casa:{stringValue: inv.x.domicilio || ''},
+  }, at);
+  await firestoreActualizarCampos(env, `vecinos/${inv.x.vecinoId}`, { uid:{stringValue:localId} }, 'Vecino');
+
+  return json({ ok:true });
 }
 
 /* ============ /finanzas/resumen — cualquier usuario autenticado ============

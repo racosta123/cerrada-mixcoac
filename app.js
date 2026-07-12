@@ -377,9 +377,11 @@ async function loadUsers(){
     const snap = await db.collection('usuarios').orderBy('rol').limit(200).get();
     const list = $('#usersList'); list.innerHTML = '';
     if (snap.empty){ list.innerHTML = '<div class="empty">Sin usuarios</div>'; return; }
+    const usuariosById = {};
     snap.forEach(doc => {
       if (doc.id === ME.uid) return;
       const u = doc.data();
+      usuariosById[doc.id] = { nombre: u.nombre||'', email: u.email||'', casa: u.casa||'', rol: u.rol };
       const row = document.createElement('div'); row.className = 'row';
       // Solo residentes se pueden suspender por mora. master no puede suspender admin.
       const puedeSuspender = u.rol==='residente' && !(ME.rol==='admin' && u.rol==='admin');
@@ -391,6 +393,10 @@ async function loadUsers(){
       } else {
         right = `<span class="tag">${roleLabel(u.rol)}</span>`;
       }
+      // Borrar cuenta: SOLO master y no sobre otra cuenta master (el Worker revalida).
+      if (ME.rol==='master' && u.rol!=='master'){
+        right += `<button class="row-act danger" data-del="${doc.id}">Borrar</button>`;
+      }
       row.innerHTML = `
         <div class="ri">${(u.nombre||'?')[0].toUpperCase()}</div>
         <div class="rt"><div class="a">${esc(u.nombre)}</div><div class="b">${esc(u.email||'')} ${u.casa?'· '+esc(u.casa):''}</div></div>
@@ -399,6 +405,7 @@ async function loadUsers(){
     });
     list.querySelectorAll('[data-susp]').forEach(b=> b.onclick=()=> toggleSuspender(b.dataset.susp, true, b));
     list.querySelectorAll('[data-react]').forEach(b=> b.onclick=()=> toggleSuspender(b.dataset.react, false, b));
+    list.querySelectorAll('[data-del]').forEach(b=> b.onclick=()=> abrirUsuarioDelSheet(b.dataset.del, usuariosById[b.dataset.del]));
   } catch(e){ $('#usersList').innerHTML = '<div class="empty">Error cargando usuarios</div>'; }
 }
 
@@ -413,6 +420,32 @@ async function toggleSuspender(uid, suspender, btn){
     btn.disabled = false; btn.textContent = suspender ? 'Suspender' : 'Reactivar';
   }
 }
+
+/* Borrado de cuenta (solo master) — confirmación por MODAL, no confirm nativo. El Worker
+   borra Auth + doc /usuarios, respalda, y limpia el uid del vecino (reinvitable). */
+let usuarioDelId = null;
+function abrirUsuarioDelSheet(uid, info){
+  usuarioDelId = uid;
+  const i = info || {};
+  $('#usuarioDelInfo').innerHTML = `<b>${esc(i.nombre||'—')}</b> · ${esc(i.email||'')}${i.casa?' · '+esc(i.casa):''}`;
+  $('#usuarioDelErr').textContent = '';
+  openSheet('#usuarioDelOverlay');
+}
+$('#usuarioDelCancel')?.addEventListener('click', () => closeSheet('#usuarioDelOverlay'));
+$('#usuarioDelOverlay')?.addEventListener('click', e => { if(e.target.id==='usuarioDelOverlay') closeSheet('#usuarioDelOverlay'); });
+$('#usuarioDelConfirm')?.addEventListener('click', async () => {
+  if (!usuarioDelId || ME.rol !== 'master') return;
+  const btn = $('#usuarioDelConfirm'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/usuarios/borrar', { uid: usuarioDelId });
+    toast('Cuenta borrada', 'bad');
+    closeSheet('#usuarioDelOverlay');
+    loadUsers();
+    refrescarVecinos();   // el uid del vecino volvió a null → domicilio reinvitable
+  } catch(e){
+    $('#usuarioDelErr').textContent = e.message || 'No se pudo borrar';
+  } finally { btn.disabled = false; btn.textContent = 'Sí, borrar cuenta'; }
+});
 
 /* ====================== VECINOS (padrón · FASE 5) ======================
    Padrón independiente de las cuentas de login. El domicilio es la fuente de verdad
@@ -461,6 +494,13 @@ function renderVecinos(){
     edit.className = 'row-act'; edit.textContent = 'Editar';
     edit.addEventListener('click', () => abrirVecinoSheet(v));
     row.appendChild(edit);
+    // Invitar (FASE 6): solo si el vecino está ACTIVO y aún no tiene cuenta vinculada.
+    if (v.estado === 'activo' && !v.uid){
+      const inv = document.createElement('button');
+      inv.className = 'row-act'; inv.textContent = '📲 Invitar';
+      inv.addEventListener('click', () => invitarVecino(v, inv));
+      row.appendChild(inv);
+    }
     list.appendChild(row);
   });
 }
@@ -539,6 +579,45 @@ $('#vecinoDelConfirm')?.addEventListener('click', async () => {
     $('#vecinoDelErr').textContent = e.message || 'No se pudo borrar';
   } finally {
     btn.disabled = false; btn.textContent = 'Sí, borrar';
+  }
+});
+
+/* Invitación por WhatsApp (FASE 6). El token lo genera el Worker; el link se arma desde
+   location.origin (sirve en local y prod). SIEMPRE Web Share; jamás wa.me ni pestañas
+   nuevas. Plan B: modal con "Copiar link" si navigator.share no existe. */
+async function invitarVecino(v, btn){
+  const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/invitaciones/crear', { vecinoId: v.id });
+    const url = new URL('registro.html', location.href).href + '#' + r.token;
+    const texto = `Hola, te invito a registrarte en la app de Cerrada Mixcoac para el domicilio ${v.domicilio}. Abre este enlace (vence en 72 h):`;
+    if (navigator.share){
+      try { await navigator.share({ title:'Cerrada Mixcoac', text: texto, url }); }
+      catch(e){ if (!(e && e.name === 'AbortError')) throw e; }   // AbortError = el usuario canceló
+    } else {
+      abrirInviteFallback(v, url);   // Plan B
+    }
+  } catch(e){
+    toast(e.message || 'No se pudo generar la invitación', 'bad');
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+let inviteFallbackUrl = null;
+function abrirInviteFallback(v, url){
+  inviteFallbackUrl = url;
+  $('#inviteFallbackInfo').innerHTML = `<b>${esc(v.domicilio)}</b> · ${esc(v.nombre)}`;
+  $('#inviteFallbackLink').value = url;
+  openSheet('#inviteFallbackOverlay');
+}
+$('#inviteFallbackClose')?.addEventListener('click', () => closeSheet('#inviteFallbackOverlay'));
+$('#inviteFallbackOverlay')?.addEventListener('click', e => { if(e.target.id==='inviteFallbackOverlay') closeSheet('#inviteFallbackOverlay'); });
+$('#inviteCopyBtn')?.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(inviteFallbackUrl);
+    toast('Link copiado', 'ok');
+  } catch(e){
+    $('#inviteFallbackLink').select(); document.execCommand('copy');
+    toast('Link copiado', 'ok');
   }
 });
 

@@ -487,6 +487,31 @@
   </div>
 </div>
 
+<!-- ============ CONFIRMAR BORRADO DE CUENTA (FASE 6) — modal, no confirm nativo ============ -->
+<div class="overlay" id="usuarioDelOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3>Borrar cuenta</h3>
+    <div class="recibo-datos" id="usuarioDelInfo"></div>
+    <p style="font-size:13px;color:var(--muted);line-height:1.6;margin:0 0 16px">Se borra la cuenta de acceso y su perfil. El domicilio queda libre para reinvitar. Se conserva un respaldo.</p>
+    <button class="btn-primary" id="usuarioDelConfirm" style="background:linear-gradient(145deg,#b91c1c,#7f1d1d);color:#fff">Sí, borrar cuenta</button>
+    <button class="btn-ghost" id="usuarioDelCancel" style="width:100%;margin-top:10px">Cancelar</button>
+    <div id="usuarioDelErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ INVITACIÓN — PLAN B (FASE 6): sin Web Share, copiar link ============ -->
+<div class="overlay" id="inviteFallbackOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3>Invitación generada</h3>
+    <div class="recibo-datos" id="inviteFallbackInfo"></div>
+    <div class="field"><label>Enlace de registro (vence en 72 h)</label><input id="inviteFallbackLink" readonly></div>
+    <button class="btn-primary" id="inviteCopyBtn">Copiar link</button>
+    <button class="btn-ghost" id="inviteFallbackClose" style="width:100%;margin-top:10px">Cerrar</button>
+  </div>
+</div>
+
 <!-- ============ NEW MOVEMENT SHEET ============ -->
 <div class="overlay" id="movOverlay">
   <div class="sheet" id="movSheet">

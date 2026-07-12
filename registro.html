@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d0d0f">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>Registro · Cerrada Mixcoac</title>
+<style>
+  :root{
+    --bg:#0d0d0f; --surface:#18181b; --surface-2:#1f1f23; --line:#2a2a30;
+    --gold:#d4af37; --gold-soft:#e8c468; --text:#f5f5f4; --muted:#a1a1aa; --muted-2:#71717a;
+    --bad:#f87171; --ok:#4ade80; --r:18px; --r-sm:13px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh; background:radial-gradient(120% 90% at 50% 0%, #16130a 0%, var(--bg) 55%);
+    color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    display:flex; align-items:center; justify-content:center; padding:24px;
+  }
+  .card{
+    width:100%; max-width:400px; background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r); padding:26px 22px; box-shadow:0 20px 60px rgba(0,0,0,.4);
+  }
+  .brand{display:flex; align-items:center; gap:12px; margin-bottom:22px}
+  .logo{width:44px; height:44px; border-radius:13px; background:linear-gradient(145deg,var(--gold),#9c7d1e);
+    display:flex; align-items:center; justify-content:center; font-weight:800; color:#1a1300; font-size:20px}
+  .brand h1{margin:0; font-size:17px; font-weight:700; letter-spacing:.2px}
+  .brand p{margin:2px 0 0; font-size:12px; color:var(--muted); letter-spacing:.4px}
+  h2{font-size:16px; font-weight:600; margin:0 0 4px}
+  .lead{font-size:13px; color:var(--muted); line-height:1.6; margin:0 0 20px}
+  .field{margin-bottom:14px}
+  .field label{display:block; font-size:12px; color:var(--muted); margin:0 0 7px 4px; letter-spacing:.3px}
+  .field input{
+    width:100%; padding:14px 15px; border-radius:var(--r-sm);
+    background:var(--surface-2); border:1px solid var(--line); color:var(--text);
+    font-size:15px; outline:none; transition:border .15s;
+  }
+  .field input:focus{border-color:var(--gold)}
+  .field input:disabled{opacity:.75; color:var(--gold-soft); font-weight:600}
+  .vecino-box{background:var(--surface-2); border:1px solid var(--line); border-radius:var(--r-sm);
+    padding:14px 16px; margin-bottom:18px}
+  .vecino-box .dom{font-size:16px; font-weight:700; color:var(--gold-soft)}
+  .vecino-box .nom{font-size:13px; color:var(--muted); margin-top:3px}
+  .btn{
+    width:100%; padding:15px; border:none; border-radius:var(--r-sm); cursor:pointer;
+    font-size:15px; font-weight:700; margin-top:6px;
+    background:linear-gradient(145deg,var(--gold),#b8941f); color:#1a1300;
+  }
+  .btn[disabled]{opacity:.6; cursor:default}
+  .btn-ghost{background:var(--surface-2); border:1px solid var(--line); color:var(--gold-soft); margin-top:10px}
+  .spinner{display:inline-block; width:16px; height:16px; border:2px solid rgba(26,19,0,.35);
+    border-top-color:#1a1300; border-radius:50%; animation:spin .7s linear infinite; vertical-align:-3px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .err{color:var(--bad); font-size:13px; margin-top:12px; min-height:18px; line-height:1.5}
+  .center{text-align:center}
+  .big-ok{width:60px; height:60px; border-radius:50%; background:rgba(74,222,128,.12);
+    display:flex; align-items:center; justify-content:center; margin:4px auto 16px}
+  .big-ok svg{width:32px; height:32px; color:var(--ok)}
+  .hidden{display:none}
+  .muted{color:var(--muted); font-size:13px; line-height:1.6}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="logo">M</div>
+    <div><h1>Cerrada Mixcoac</h1><p>REGISTRO DE RESIDENTE</p></div>
+  </div>
+
+  <!-- Estado: validando -->
+  <div id="loadingState" class="center">
+    <p class="muted"><span class="spinner" style="border-color:rgba(212,175,55,.3);border-top-color:var(--gold)"></span>&nbsp; Validando invitación…</p>
+  </div>
+
+  <!-- Estado: invitación inválida -->
+  <div id="invalidState" class="hidden center">
+    <h2>Invitación no válida</h2>
+    <p class="lead" id="invalidMsg">Este enlace no es válido, ya se usó o venció. Pídele a la administración una invitación nueva.</p>
+  </div>
+
+  <!-- Estado: formulario -->
+  <div id="formState" class="hidden">
+    <h2>Crea tu cuenta</h2>
+    <p class="lead">Completa tu registro para acceder a la app de la cerrada.</p>
+    <div class="vecino-box">
+      <div class="dom" id="veDomicilio">—</div>
+      <div class="nom" id="veNombre">—</div>
+    </div>
+    <div class="field"><label>Correo</label><input id="email" type="email" inputmode="email" placeholder="correo@correo.com" autocomplete="email"></div>
+    <div class="field"><label>Contraseña (mínimo 8)</label><input id="pass" type="password" placeholder="••••••••" autocomplete="new-password"></div>
+    <div class="field"><label>Confirmar contraseña</label><input id="pass2" type="password" placeholder="••••••••" autocomplete="new-password"></div>
+    <button class="btn" id="submitBtn">Crear mi cuenta</button>
+    <div class="err" id="formErr"></div>
+  </div>
+
+  <!-- Estado: éxito -->
+  <div id="doneState" class="hidden center">
+    <div class="big-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></div>
+    <h2>¡Cuenta creada!</h2>
+    <p class="lead">Tu domicilio quedó vinculado. Instala la app y entra con tu correo y contraseña.</p>
+    <button class="btn hidden" id="installBtn">📲 Instalar app</button>
+    <a href="index.html"><button class="btn btn-ghost">Abrir la app</button></a>
+  </div>
+</div>
+
+<script src="config.js"></script>
+<script>
+(function(){
+  const $ = s => document.querySelector(s);
+  const show = id => { ['loadingState','invalidState','formState','doneState'].forEach(s => $('#'+s).classList.toggle('hidden', s!==id)); };
+  // config.js declara `const CONFIG` (ámbito léxico global, no window) — se referencia directo.
+  const WORKER = (typeof CONFIG !== 'undefined' && CONFIG.workerUrl) ? CONFIG.workerUrl : '';
+  const token = decodeURIComponent((location.hash || '').slice(1));
+
+  async function api(path, body){
+    const r = await fetch(WORKER + path, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok) throw new Error(data.error || 'Error');
+    return data;
+  }
+
+  // Banner de instalación PWA (mismo patrón que las otras apps): se captura al cargar y
+  // se ofrece al terminar el registro.
+  let deferredPrompt = null;
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredPrompt = e; });
+
+  if (!token){ show('invalidState'); return; }
+
+  // 1) Validar el token contra el Worker (nombre + domicilio precargados, no editables).
+  (async () => {
+    try {
+      const v = await api('/invitaciones/validar', { token });
+      $('#veDomicilio').textContent = v.domicilio || '—';
+      $('#veNombre').textContent = v.nombre || '';
+      show('formState');
+    } catch(e){
+      $('#invalidMsg').textContent = 'Este enlace no es válido, ya se usó o venció. Pídele a la administración una invitación nueva.';
+      show('invalidState');
+    }
+  })();
+
+  // 2) Completar el registro.
+  $('#submitBtn').addEventListener('click', async () => {
+    const email = $('#email').value.trim();
+    const pass  = $('#pass').value;
+    const pass2 = $('#pass2').value;
+    $('#formErr').textContent = '';
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ $('#formErr').textContent = 'Escribe un correo válido.'; return; }
+    if (pass.length < 8){ $('#formErr').textContent = 'La contraseña debe tener al menos 8 caracteres.'; return; }
+    if (pass !== pass2){ $('#formErr').textContent = 'Las contraseñas no coinciden.'; return; }
+    const btn = $('#submitBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+    try {
+      await api('/invitaciones/completar', { token, email, password: pass });
+      show('doneState');
+      if (deferredPrompt){
+        const ib = $('#installBtn'); ib.classList.remove('hidden');
+        ib.addEventListener('click', async () => {
+          ib.disabled = true;
+          deferredPrompt.prompt();
+          await deferredPrompt.userChoice.catch(()=>{});
+          deferredPrompt = null; ib.classList.add('hidden');
+        });
+      }
+    } catch(e){
+      $('#formErr').textContent = e.message || 'No se pudo completar el registro.';
+      btn.disabled = false; btn.textContent = 'Crear mi cuenta';
+    }
+  });
+})();
+</script>
+</body>
+</html>

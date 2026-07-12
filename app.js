@@ -540,8 +540,11 @@ function renderTermometro(pagaron, totalCasas){
   $('#thermText').textContent = `${pagaron} de ${totalCasas} casas pagaron (${pct}%)`;
 }
 
-/* -------- casas únicas que ya pagaron Cuota este mes (solo staff, desde finCache) -------- */
-function pagaronDelMes(){
+/* -------- fuente ÚNICA: casas (número como string) que pagaron Cuota este mes --------
+   Compartida por el termómetro, la lista de morosos y la consulta por casa, para que
+   NUNCA vuelvan a divergir (ese fue el bug de FASE 4.5: el termómetro contaba el set y
+   morosos lo comparaba contra 1..N; con casa de texto libre no casaban). */
+function casasPagadasDelMes(){
   const curKey = monthKey(new Date());
   const set = new Set();
   finCache.forEach(m => {
@@ -549,37 +552,81 @@ function pagaronDelMes(){
       set.add(normalizarCasa(m.casa));
     }
   });
-  return set.size;
+  return set;
 }
+function pagaronDelMes(){ return casasPagadasDelMes().size; }
 
-/* -------- lista de morosos del mes (solo staff) -------- */
+/* -------- lista de morosos del mes (solo staff) — colapsable, cerrada por default -------- */
+let morososExpandido = false;
 function renderMorosos(){
   const list = $('#morososList');
+  const countEl = $('#morososCount');
+  const toggle = $('#morososToggle');
   const totalCasas = CONFIG_GENERAL.totalCasas;
-  if (!totalCasas){ list.innerHTML = '<div class="empty">Configura el número de casas para ver esta lista</div>'; return; }
 
-  const curKey = monthKey(new Date());
-  const pagaronSet = new Set();
-  finCache.forEach(m => {
-    if (m.tipo==='ingreso' && (m.categoria||'')==='Cuota' && monthKey(m.ts)===curKey && m.casa) {
-      pagaronSet.add(normalizarCasa(m.casa));
-    }
-  });
+  poblarConsultaCasa();
 
+  if (!totalCasas){
+    countEl.textContent = 'Configura el número de casas';
+    list.innerHTML = '<div class="empty">Configura el número de casas para ver esta lista</div>';
+    return;
+  }
+
+  const pagaronSet = casasPagadasDelMes();
   const casasValidas = Array.from({length: totalCasas}, (_,i) => String(i+1));
   const morosos = casasValidas.filter(c => !pagaronSet.has(c));
   const noReconocidos = [...pagaronSet].filter(c => !casasValidas.includes(c));
 
-  if (!morosos.length && !noReconocidos.length){ list.innerHTML = '<div class="empty">Todas las casas están al corriente</div>'; return; }
+  countEl.textContent = `${morosos.length} casa${morosos.length===1?'':'s'} sin pago`;
 
-  let html = morosos.map(c => `
-    <div class="row"><div class="rt"><div class="a">Casa ${esc(c)}</div></div><span class="tag out">Sin pago</span></div>`).join('');
+  let html = morosos.length
+    ? morosos.map(c => `<div class="row"><div class="rt"><div class="a">Casa ${esc(c)}</div></div><span class="tag out">Sin pago</span></div>`).join('')
+    : '<div class="empty">Todas las casas están al corriente</div>';
   if (noReconocidos.length){
     html += `<div class="section-title" style="margin-top:14px;font-size:12px">No reconocidos (fuera de 1–${totalCasas})</div>` +
       noReconocidos.map(c => `<div class="row"><div class="rt"><div class="a">${esc(c)}</div></div><span class="tag">Revisar</span></div>`).join('');
   }
   list.innerHTML = html;
+  list.classList.toggle('hidden', !morososExpandido);
+  toggle.classList.toggle('abierto', morososExpandido);
 }
+$('#morososToggle').addEventListener('click', () => {
+  morososExpandido = !morososExpandido;
+  $('#morososList').classList.toggle('hidden', !morososExpandido);
+  $('#morososToggle').classList.toggle('abierto', morososExpandido);
+});
+
+/* -------- consultar el estado de una casa específica (solo staff) -------- */
+function poblarConsultaCasa(){
+  const sel = $('#consultaCasaSel');
+  const total = CONFIG_GENERAL.totalCasas;
+  const prev = sel.value;
+  if (!total){ sel.innerHTML = '<option value="">—</option>'; renderConsultaCasa(); return; }
+  let html = '<option value="">Elige una casa…</option>';
+  for (let i = 1; i <= total; i++) html += `<option value="${i}">Casa ${i}</option>`;
+  sel.innerHTML = html;
+  if (prev) sel.value = prev;
+  renderConsultaCasa();   // refresca el resultado con datos en vivo si había casa elegida
+}
+function renderConsultaCasa(){
+  const box = $('#consultaCasaResult');
+  const casa = $('#consultaCasaSel').value;
+  if (!casa){ box.classList.add('hidden'); box.classList.remove('pagado'); return; }
+  const curKey = monthKey(new Date());
+  const pago = finCache.find(m => m.tipo==='ingreso' && (m.categoria||'')==='Cuota'
+      && monthKey(m.ts)===curKey && normalizarCasa(m.casa)===casa);
+  box.classList.remove('hidden');
+  if (pago){
+    box.classList.add('pagado');
+    box.innerHTML = `<div class="a">Casa ${esc(casa)} · <b>pagó</b></div>`
+      + `<div class="sub">${esc(pago.folioRecibo||'sin folio')} · ${money(pago.monto)} · ${fmtTime(pago.ts)}</div>`;
+  } else {
+    box.classList.remove('pagado');
+    box.innerHTML = `<div class="a">Casa ${esc(casa)} · sin pago este mes</div>`
+      + `<div class="sub">No hay Cuota registrada para esta casa en el mes en curso.</div>`;
+  }
+}
+$('#consultaCasaSel').addEventListener('change', renderConsultaCasa);
 
 /* -------- config de número de casas (solo staff) -------- */
 const TOTAL_CASAS_PRESETS = ['50','100','150','200','250','300'];
@@ -1002,8 +1049,26 @@ async function borrarMovimiento(m, btn){
 const normalizarCasa = s => String(s||'').trim().replace(/\s+/g,' ');
 /* FASE 4.5: casa obligatoria en TODO ingreso — cada recibo queda amarrado a una casa. */
 function casaRequerida(){ return movType==='ingreso'; }
+/* FASE 4.6: el campo Casa es un dropdown numérico 1..totalCasas (leído de config),
+   ya no texto libre — así el valor guardado siempre casa con la lista de morosos. */
+function poblarCasaSelect(){
+  const sel = $('#movCasa');
+  const total = CONFIG_GENERAL?.totalCasas;
+  const prev = sel.value;
+  if (!total){
+    sel.innerHTML = '<option value="">Configura el número de casas primero</option>';
+    sel.disabled = true; return;
+  }
+  sel.disabled = false;
+  let html = '<option value="">Selecciona la casa…</option>';
+  for (let i = 1; i <= total; i++) html += `<option value="${i}">Casa ${i}</option>`;
+  sel.innerHTML = html;
+  if (prev) sel.value = prev;   // conserva selección si sigue en rango
+}
 function updateCasaField(){
-  $('#movCasaField').classList.toggle('hidden', !casaRequerida());
+  const req = casaRequerida();
+  $('#movCasaField').classList.toggle('hidden', !req);
+  if (req) poblarCasaSelect();
 }
 $('#newMovBtn').addEventListener('click', ()=>{ $('#movErr').textContent=''; updateCasaField(); openSheet('#movOverlay'); });
 $('#movOverlay').addEventListener('click', e => { if(e.target.id==='movOverlay') closeSheet('#movOverlay'); });
@@ -1020,10 +1085,10 @@ async function saveMov(){
   const concepto = $('#movConcept').value.trim();
   const categoria = $('#movCat').value.trim() || 'Otro';
   const monto = parseFloat($('#movAmount').value);
-  const casa = normalizarCasa($('#movCasa').value);
+  const casa = $('#movCasa').value;  // FASE 4.6: dropdown numérico → "1".."totalCasas" o ""
   $('#movErr').textContent = '';
   if (!concepto || !(monto > 0)){ $('#movErr').textContent = 'Falta concepto o monto válido'; return; }
-  if (casaRequerida() && !casa){ $('#movErr').textContent = 'Falta el número de casa (obligatorio en ingresos)'; return; }
+  if (casaRequerida() && !casa){ $('#movErr').textContent = 'Selecciona la casa (obligatorio en ingresos)'; return; }
   const btn = $('#saveMovBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
     // El movimiento lo escribe el Worker tras verificar rol master/admin.

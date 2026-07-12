@@ -173,10 +173,6 @@ async function suspenderUsuario(req, env) {
 
 // Trim + colapsa espacios dobles/múltiples a uno solo (no prohíbe espacios internos,
 // solo normaliza — así "casa  57" y "casa 57" terminan guardados igual).
-function normalizarCasa(s) {
-  return String(s || '').trim().replace(/\s+/g, ' ');
-}
-
 /* ============ /finanzas/registrar — solo master/admin ============ */
 async function registrarFinanza(req, env) {
   const user = await requireAuth(req, env);
@@ -189,14 +185,26 @@ async function registrarFinanza(req, env) {
   if (!concepto || !(m > 0)) throw httpErr(400, 'Concepto o monto inválido');
 
   const cat = String(categoria||'Otro').slice(0,40);
-  const casaNorm = normalizarCasa(casa).slice(0,40);
-  // Casa obligatoria en TODO ingreso (FASE 4.5): cada recibo queda amarrado a una
-  // casa, y las cuotas además alimentan el termómetro y la lista de morosos.
-  if (tipo === 'ingreso' && !casaNorm) {
-    throw httpErr(400, 'Falta el número/identificador de casa para un ingreso');
+
+  // FASE 4.6: en ingresos, casa DEBE ser un entero 1..totalCasas — NO se confía en el
+  // frontend. El valor canónico guardado es el número como string ("1"), que casa
+  // directo con la lista de morosos (antes se aceptaba texto libre y divergían).
+  let casaCanon = '';
+  if (tipo === 'ingreso') {
+    const config = await getConfigGeneral(env);
+    const total = Number(config?.totalCasas);
+    if (!Number.isInteger(total) || total <= 0) {
+      throw httpErr(400, 'Configura el número de casas antes de registrar ingresos');
+    }
+    const n = Number(String(casa == null ? '' : casa).trim());
+    if (!Number.isInteger(n) || n < 1 || n > total) {
+      throw httpErr(400, `Casa inválida: debe ser un número entre 1 y ${total}`);
+    }
+    casaCanon = String(n);
   }
 
   // Los ingresos llevan recibo: folio consecutivo del mes, asignado de forma atómica.
+  // Se asigna DESPUÉS de validar la casa para no quemar un folio en un registro inválido.
   const folioRecibo = tipo === 'ingreso' ? await siguienteFolioRecibo(env) : '';
 
   const id = crypto.randomUUID();
@@ -205,7 +213,7 @@ async function registrarFinanza(req, env) {
     concepto:{stringValue:String(concepto).slice(0,120)},
     categoria:{stringValue:cat},
     monto:{doubleValue:m},
-    casa:{stringValue:casaNorm},
+    casa:{stringValue:casaCanon},
     ...(folioRecibo ? { folioRecibo:{stringValue:folioRecibo} } : {}),
     creadoPor:{stringValue:user.uid},
     creadoNombre:{stringValue:perfil.nombre||''},

@@ -45,7 +45,10 @@ export default {
         case '/finanzas/resumen':  out = await resumenFinanzas(req, env); break;
         case '/finanzas/marcar-recibo': out = await marcarRecibo(req, env); break;
         case '/finanzas/borrar':   out = await borrarFinanza(req, env); break;
-        case '/config/actualizar': out = await actualizarConfig(req, env); break;
+        case '/vecinos/crear':     out = await crearVecino(req, env); break;
+        case '/vecinos/actualizar': out = await actualizarVecino(req, env); break;
+        case '/vecinos/borrar':    out = await borrarVecino(req, env); break;
+        case '/vecinos/listar':    out = await listarVecinos(req, env); break;
         case '/usuarios/crear':    out = await crearUsuario(req, env); break;
         case '/usuarios/suspender': out = await suspenderUsuario(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
@@ -186,21 +189,18 @@ async function registrarFinanza(req, env) {
 
   const cat = String(categoria||'Otro').slice(0,40);
 
-  // FASE 4.6: en ingresos, casa DEBE ser un entero 1..totalCasas — NO se confía en el
-  // frontend. El valor canónico guardado es el número como string ("1"), que casa
-  // directo con la lista de morosos (antes se aceptaba texto libre y divergían).
+  // FASE 5: en ingresos, casa DEBE coincidir con el domicilio de un vecino ACTIVO del
+  // padrón (comparación normalizada; NO se confía en el frontend). Se guarda el domicilio
+  // canónico del padrón para que morosos/termómetro/consulta casen exacto.
   let casaCanon = '';
   if (tipo === 'ingreso') {
-    const config = await getConfigGeneral(env);
-    const total = Number(config?.totalCasas);
-    if (!Number.isInteger(total) || total <= 0) {
-      throw httpErr(400, 'Configura el número de casas antes de registrar ingresos');
-    }
-    const n = Number(String(casa == null ? '' : casa).trim());
-    if (!Number.isInteger(n) || n < 1 || n > total) {
-      throw httpErr(400, `Casa inválida: debe ser un número entre 1 y ${total}`);
-    }
-    casaCanon = String(n);
+    const dom = String(casa == null ? '' : casa).trim().replace(/\s+/g, ' ');
+    if (!dom) throw httpErr(400, 'Falta el domicilio para un ingreso');
+    const domNorm = normDomicilio(dom);
+    const vecinos = (await firestoreList(env, 'vecinos')).map(d => readDoc(d.fields));
+    const match = vecinos.find(v => v.domicilioNorm === domNorm && (v.estado || 'activo') === 'activo');
+    if (!match) throw httpErr(400, `Domicilio no registrado o suspendido: "${dom}"`);
+    casaCanon = match.domicilio;
   }
 
   // Los ingresos llevan recibo: folio consecutivo del mes, asignado de forma atómica.
@@ -266,7 +266,7 @@ async function marcarRecibo(req, env) {
   const campo = accion === 'compartido' ? 'reciboCompartidoTs' : 'reciboDescargadoTs';
   await firestoreActualizarCampos(env, `finanzas/${id}`, {
     [campo]:{timestampValue:new Date().toISOString()},
-  });
+  }, 'Movimiento');
   return json({ ok:true, id, [campo]: true });
 }
 
@@ -300,20 +300,190 @@ async function borrarFinanza(req, env) {
   return json({ ok:true, id });
 }
 
-/* ============ /config/actualizar — solo master/admin ============ */
-async function actualizarConfig(req, env) {
+/* ===========================================================
+   VECINOS (padrón) — FASE 5, solo staff
+   Padrón de jefes de familia. El domicilio es la fuente de verdad de las "casas"
+   en Finanzas. Campos uid/miembros quedan reservados para FASE 6 (vínculo con
+   cuentas de login); aquí solo se inicializan, no se usan.
+   El cliente NUNCA lee vecinos directo: lo hace vía /vecinos/listar (sin match en
+   las reglas = denegado por default), así no hubo que tocar firestore.rules.
+   =========================================================== */
+
+/* Normaliza el domicilio SOLO para comparar unicidad: trim + colapsar espacios +
+   MAYÚSCULAS. Así "Ajoya 12", "ajoya 12" y "AJOYA  12" son la misma casa. */
+function normDomicilio(s) {
+  return String(s || '').trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
+async function crearVecino(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo master/admin configuran');
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff da de alta vecinos');
 
-  const { totalCasas } = await req.json();
-  const n = Number(totalCasas);
-  if (!Number.isInteger(n) || n <= 0) throw httpErr(400, 'totalCasas debe ser un entero positivo');
+  const { nombre, correo, telefono, domicilio } = await req.json();
+  const nom = String(nombre || '').trim().slice(0, 80);
+  const tel = String(telefono || '').trim().slice(0, 30);
+  const dom = String(domicilio || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+  const cor = String(correo || '').trim().slice(0, 120);
+  if (!nom) throw httpErr(400, 'Falta el nombre del vecino');
+  if (!tel) throw httpErr(400, 'El teléfono es obligatorio');
+  if (!dom) throw httpErr(400, 'Falta el domicilio');
+  const domNorm = normDomicilio(dom);
 
-  await firestoreSet(env, 'config/general', {
-    totalCasas:{integerValue:n},
+  // Anti-duplicados server-side: el domicilio normalizado no debe existir aún.
+  const existentes = (await firestoreList(env, 'vecinos')).map(d => readDoc(d.fields));
+  if (existentes.some(v => v.domicilioNorm === domNorm)) {
+    throw httpErr(409, `Ya existe un vecino con el domicilio "${dom}"`);
+  }
+
+  const id = crypto.randomUUID();
+  await firestoreSet(env, `vecinos/${id}`, {
+    nombre:{stringValue:nom},
+    correo:{stringValue:cor},
+    telefono:{stringValue:tel},
+    domicilio:{stringValue:dom},
+    domicilioNorm:{stringValue:domNorm},
+    estado:{stringValue:'activo'},
+    uid:{nullValue:null},                    // reservado FASE 6
+    miembros:{arrayValue:{values:[]}},       // reservado FASE 6
+    creadoPor:{stringValue:user.uid},
+    creadoNombre:{stringValue:perfil.nombre||''},
+    ts:{timestampValue:new Date().toISOString()},
   });
-  return json({ ok:true, totalCasas:n });
+  return json({ ok:true, id });
+}
+
+async function actualizarVecino(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff edita vecinos');
+
+  const { id, nombre, correo, telefono, domicilio, estado } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+
+  const fields = {};
+  if (nombre !== undefined) {
+    const nom = String(nombre).trim().slice(0, 80);
+    if (!nom) throw httpErr(400, 'El nombre no puede quedar vacío');
+    fields.nombre = {stringValue:nom};
+  }
+  if (correo !== undefined) fields.correo = {stringValue:String(correo).trim().slice(0,120)};
+  if (telefono !== undefined) {
+    const tel = String(telefono).trim();
+    if (!tel) throw httpErr(400, 'El teléfono es obligatorio');
+    fields.telefono = {stringValue:tel.slice(0,30)};
+  }
+  if (estado !== undefined) {
+    if (!['activo','suspendido'].includes(estado)) throw httpErr(400, 'estado inválido');
+    fields.estado = {stringValue:estado};
+  }
+  if (domicilio !== undefined) {
+    const dom = String(domicilio).trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!dom) throw httpErr(400, 'Falta el domicilio');
+    const domNorm = normDomicilio(dom);
+    const existentes = await firestoreList(env, 'vecinos');
+    const dup = existentes.some(d => d.name.split('/').pop() !== id && readDoc(d.fields).domicilioNorm === domNorm);
+    if (dup) throw httpErr(409, `Ya existe otro vecino con el domicilio "${dom}"`);
+    fields.domicilio = {stringValue:dom};
+    fields.domicilioNorm = {stringValue:domNorm};
+  }
+  if (!Object.keys(fields).length) throw httpErr(400, 'Nada que actualizar');
+
+  await firestoreActualizarCampos(env, `vecinos/${id}`, fields, 'Vecino');
+  return json({ ok:true, id });
+}
+
+async function listarVecinos(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff consulta el padrón');
+
+  const docs = await firestoreList(env, 'vecinos');
+  const vecinos = docs.map(d => {
+    const x = readDoc(d.fields);
+    return {
+      id: d.name.split('/').pop(),
+      nombre: x.nombre || '',
+      correo: x.correo || '',
+      telefono: x.telefono || '',
+      domicilio: x.domicilio || '',
+      domicilioNorm: x.domicilioNorm || '',
+      estado: x.estado || 'activo',
+      uid: x.uid ?? null,          // reservado FASE 6
+    };
+  });
+  // El conteo de activos se calcula AQUÍ (server-side) y es el que usa el termómetro:
+  // el frontend no lo deriva por su cuenta (no se confía en el cliente).
+  const activos = vecinos.filter(v => v.estado === 'activo').length;
+  return json({ vecinos, activos });
+}
+
+/* ============ /vecinos/borrar — SOLO master ============
+   Baja del padrón con respaldo (mismo patrón que finanzas/borrar). Reglas:
+   - Solo master (validado aquí, no se confía en el frontend).
+   - Bloquea si el vecino tiene pagos en finanzas → evita recibos huérfanos; en ese
+     caso solo se permite editar/suspender.
+   - Copia el doc completo a vecinos_borrados (quién/cuándo/snapshot) y lo elimina de
+     "vecinos", con lo que el domicilio se LIBERA para el anti-dup (que solo compara
+     contra vecinos vivos, nunca contra borrados).
+   - Deja registro en la bitácora. */
+async function borrarVecino(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master borra vecinos');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const rGet = await fetch(`${fsBase(env)}/vecinos/${id}`, { headers:{ Authorization:'Bearer '+at } });
+  if (rGet.status === 404) throw httpErr(404, 'Vecino no existe');
+  if (!rGet.ok) throw httpErr(500, 'Firestore get falló');
+  const docActual = await rGet.json();
+  const vecino = readDoc(docActual.fields);
+  const domNorm = vecino.domicilioNorm || normDomicilio(vecino.domicilio || '');
+
+  // Bloqueo por pagos: si existe algún movimiento de finanzas de este domicilio, no se
+  // borra (los recibos quedarían huérfanos). Solo editar/suspender.
+  const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
+  const tienePagos = finanzas.some(m => m.casa && normDomicilio(m.casa) === domNorm);
+  if (tienePagos) {
+    throw httpErr(409, 'Este vecino tiene pagos registrados: solo puedes editarlo o suspenderlo, no borrarlo');
+  }
+
+  await firestoreSet(env, `vecinos_borrados/${id}`, {
+    ...(docActual.fields || {}),
+    borradoPor:{stringValue:user.uid},
+    borradoNombre:{stringValue:perfil.nombre||''},
+    borradoTs:{timestampValue:new Date().toISOString()},
+  }, at);
+
+  const rDel = await fetch(`${fsBase(env)}/vecinos/${id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  if (!rDel.ok) throw httpErr(500, 'Firestore delete falló');
+
+  await logBitacora(env, at, {
+    uid: user.uid,
+    nombre: `${perfil.nombre || 'Master'} borró al vecino ${vecino.domicilio || id}`,
+  });
+
+  return json({ ok:true, id });
+}
+
+/* Registro de acción administrativa en la bitácora (colección aperturas). tipo:'gestion'
+   la distingue de aperturas de puertas; hogar = uid del staff que actúa, así los
+   residentes (que filtran su bitácora por hogar) no la ven — solo staff. */
+async function logBitacora(env, at, { uid, nombre }) {
+  await fetch(`${fsBase(env)}/aperturas`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ fields: {
+      uid:{stringValue:uid},
+      nombre:{stringValue:nombre},
+      puerta:{stringValue:'gestion'},
+      hogar:{stringValue:uid},
+      tipo:{stringValue:'gestion'},
+      ts:{timestampValue:new Date().toISOString()},
+    }}),
+  });
 }
 
 /* ============ /finanzas/resumen — cualquier usuario autenticado ============
@@ -342,12 +512,14 @@ async function resumenFinanzas(req, env) {
     if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa) pagaron.add(d.casa);
   }
 
-  const config = await getConfigGeneral(env);
+  // FASE 5: el total es el # de vecinos ACTIVOS del padrón (ya no config.totalCasas).
+  const vecinos = (await firestoreList(env, 'vecinos')).map(d => readDoc(d.fields));
+  const totalCasas = vecinos.filter(v => (v.estado || 'activo') === 'activo').length;
 
   return json({
     ingreso, egreso, balance: ingreso - egreso,
     pagaron: pagaron.size,
-    totalCasas: config?.totalCasas ?? null,
+    totalCasas,
   });
 }
 
@@ -479,14 +651,7 @@ async function getPerfil(env, uid) {
   const d = await r.json();
   return readDoc(d.fields);
 }
-async function getConfigGeneral(env) {
-  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
-  const r = await fetch(`${fsBase(env)}/config/general`, { headers:{ Authorization:'Bearer '+at } });
-  if (!r.ok) return null;
-  const d = await r.json();
-  return readDoc(d.fields);
-}
-/* Lista completa de una colección (paginada) — usada por /finanzas/resumen. */
+/* Lista completa de una colección (paginada) — usada por /finanzas/resumen y vecinos. */
 async function firestoreList(env, coleccion) {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const docs = [];
@@ -527,14 +692,14 @@ async function firestoreUpdate(env, path, fields, mask) {
 }
 /* Como firestoreUpdate pero estricto: máscara derivada de los campos, exige que el
    documento exista (no crea fantasmas si el id es inválido) y truena con error claro. */
-async function firestoreActualizarCampos(env, path, fields) {
+async function firestoreActualizarCampos(env, path, fields, label = 'Documento') {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const qs = Object.keys(fields).map(f=>`updateMask.fieldPaths=${encodeURIComponent(f)}`).join('&');
   const r = await fetch(`${fsBase(env)}/${path}?${qs}&currentDocument.exists=true`, {
     method:'PATCH', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
     body: JSON.stringify({ fields }),
   });
-  if (r.status === 404 || r.status === 400) throw httpErr(404, 'Movimiento no existe');
+  if (r.status === 404 || r.status === 400) throw httpErr(404, `${label} no existe`);
   if (!r.ok) throw httpErr(500, 'Firestore update falló');
 }
 async function logApertura(env, o) {

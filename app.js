@@ -27,8 +27,8 @@ let ME = null;          // { uid, nombre, rol, casa, residenteUid? }
 let unsubLog = null;
 let unsubInvites = null;
 let unsubFin = null;
-let unsubConfig = null;
-let CONFIG_GENERAL = { totalCasas: null };
+let vecinosCache = [];        // padrón (FASE 5): fuente de verdad de las casas en Finanzas
+let vecinosActivosCount = 0;  // conteo de activos calculado por el Worker (denominador del termómetro)
 
 /* ====================== UTILIDADES ====================== */
 const $ = s => document.querySelector(s);
@@ -159,7 +159,7 @@ function buildTabs(){
     b.onclick = ()=> switchTab(t.id, b);
     bar.appendChild(b);
   });
-  if (isStaff) loadUsers();
+  if (isStaff){ loadUsers(); loadVecinos(); }
 }
 
 function switchTab(id, btn){
@@ -223,9 +223,18 @@ function renderLog(snap){
   list.innerHTML = '';
   snap.forEach(doc => {
     const a = doc.data();
-    const sentido = a.puerta==='salida' ? 'out' : 'in';
     const row = document.createElement('div');
     row.className = 'row';
+    if (a.tipo === 'gestion'){
+      // Acción administrativa (FASE 5), no una apertura de puerta: ícono de engrane,
+      // el texto ya describe la acción, sin etiqueta Entrada/Salida.
+      row.innerHTML = `
+        <div class="ri"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
+        <div class="rt"><div class="a">${esc(a.nombre || 'Gestión')}</div><div class="b">Gestión · ${fmtTime(a.ts)}</div></div>
+        <span class="tag">Gestión</span>`;
+      list.appendChild(row); return;
+    }
+    const sentido = a.puerta==='salida' ? 'out' : 'in';
     row.innerHTML = `
       <div class="ri"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="16" height="12" rx="2"/><path d="M8 9V6a4 4 0 0 1 8 0v3"/></svg></div>
       <div class="rt"><div class="a">${esc(a.nombre || 'Usuario')}</div><div class="b">${puertaName(a.puerta)} · ${fmtTime(a.ts)}${a.tipo==='qr' ? ' · QR' : ''}</div></div>
@@ -405,6 +414,134 @@ async function toggleSuspender(uid, suspender, btn){
   }
 }
 
+/* ====================== VECINOS (padrón · FASE 5) ======================
+   Padrón independiente de las cuentas de login. El domicilio es la fuente de verdad
+   de las casas en Finanzas. Se lee/escribe SOLO vía Worker (staff). Campos uid/miembros
+   quedan reservados para FASE 6; aquí no se usan. */
+const normDom = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
+function vecinosActivos(){ return vecinosCache.filter(v => v.estado === 'activo'); }
+
+async function cargarVecinos(){
+  try {
+    const r = await authedFetch('/vecinos/listar', {});
+    vecinosCache = Array.isArray(r.vecinos) ? r.vecinos : [];
+    // El denominador del termómetro sale del Worker (no se cuenta en el frontend).
+    vecinosActivosCount = Number.isInteger(r.activos) ? r.activos : vecinosCache.filter(v=>v.estado==='activo').length;
+  } catch(e){ console.error('cargarVecinos', e); vecinosCache = []; vecinosActivosCount = 0; }
+}
+/* recarga el padrón y refresca TODO lo que depende de él: la lista y, si Finanzas ya se
+   pintó, termómetro + morosos (que dependen de los vecinos activos). */
+async function refrescarVecinos(){
+  await cargarVecinos();
+  renderVecinos();
+  if (finMonths.length){
+    renderTermometro(pagaronDelMes(), vecinosActivosCount);
+    renderMorosos();
+  }
+}
+async function loadVecinos(){ await refrescarVecinos(); }
+
+function renderVecinos(){
+  const list = $('#vecinosList');
+  const raw = $('#vecinoSearch').value.trim();
+  const q = normDom(raw);
+  let arr = vecinosCache.slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+  if (q) arr = arr.filter(v =>
+    normDom(v.nombre).includes(q) || (v.domicilioNorm||'').includes(q) || (v.telefono||'').includes(raw));
+  if (!arr.length){ list.innerHTML = '<div class="empty">Sin vecinos</div>'; return; }
+  list.innerHTML = '';
+  arr.forEach(v => {
+    const susp = v.estado === 'suspendido';
+    const row = document.createElement('div'); row.className = 'row';
+    row.innerHTML = `
+      <div class="ri">${(v.nombre||'?')[0].toUpperCase()}</div>
+      <div class="rt"><div class="a">${esc(v.domicilio)}</div><div class="b">${esc(v.nombre)}${v.telefono?' · '+esc(v.telefono):''}</div></div>
+      <div style="display:flex;gap:8px;align-items:center">${susp?'<span class="tag susp">Suspendido</span>':'<span class="tag">Activo</span>'}</div>`;
+    const edit = document.createElement('button');
+    edit.className = 'row-act'; edit.textContent = 'Editar';
+    edit.addEventListener('click', () => abrirVecinoSheet(v));
+    row.appendChild(edit);
+    list.appendChild(row);
+  });
+}
+$('#vecinoSearch')?.addEventListener('input', renderVecinos);
+
+let vecinoEditId = null;   // null = alta; id = edición
+function abrirVecinoSheet(v){
+  vecinoEditId = v ? v.id : null;
+  $('#vecinoTitle').textContent = v ? 'Editar vecino' : 'Alta de vecino';
+  $('#veName').value   = v?.nombre   || '';
+  $('#veCorreo').value = v?.correo   || '';
+  $('#veTel').value    = v?.telefono || '';
+  $('#veDom').value    = v?.domicilio|| '';
+  $('#veEstado').value = v?.estado   || 'activo';
+  $('#veEstadoField').classList.toggle('hidden', !v);   // estado solo en edición
+  // Borrar: SOLO master y solo en edición (el Worker revalida master + reglas de borrado).
+  $('#delVecinoBtn').classList.toggle('hidden', !(v && ME.rol === 'master'));
+  $('#veErr').textContent = '';
+  $('#saveVecinoBtn').textContent = v ? 'Guardar cambios' : 'Guardar vecino';
+  openSheet('#vecinoOverlay');
+}
+$('#newVecinoBtn')?.addEventListener('click', () => abrirVecinoSheet(null));
+$('#vecinoOverlay')?.addEventListener('click', e => { if(e.target.id==='vecinoOverlay') closeSheet('#vecinoOverlay'); });
+$('#saveVecinoBtn')?.addEventListener('click', guardarVecino);
+
+async function guardarVecino(){
+  const nombre    = $('#veName').value.trim();
+  const correo    = $('#veCorreo').value.trim();
+  const telefono  = $('#veTel').value.trim();
+  const domicilio = $('#veDom').value.trim();
+  const estado    = $('#veEstado').value;
+  $('#veErr').textContent = '';
+  if (!nombre){ $('#veErr').textContent = 'Falta el nombre'; return; }
+  if (!telefono){ $('#veErr').textContent = 'El teléfono es obligatorio'; return; }
+  if (!domicilio){ $('#veErr').textContent = 'Falta el domicilio'; return; }
+  const btn = $('#saveVecinoBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    // El Worker valida rol staff y el anti-duplicados de domicilio server-side.
+    if (vecinoEditId){
+      await authedFetch('/vecinos/actualizar', { id: vecinoEditId, nombre, correo, telefono, domicilio, estado });
+      toast('Vecino actualizado', 'ok');
+    } else {
+      await authedFetch('/vecinos/crear', { nombre, correo, telefono, domicilio });
+      toast('Vecino dado de alta', 'ok');
+    }
+    closeSheet('#vecinoOverlay');
+    await refrescarVecinos();
+  } catch(e){
+    $('#veErr').textContent = e.message || 'No se pudo guardar';
+  } finally {
+    btn.disabled = false; btn.textContent = vecinoEditId ? 'Guardar cambios' : 'Guardar vecino';
+  }
+}
+
+/* Borrado de vecino (solo master) — confirmación por MODAL, no confirm nativo.
+   El Worker revalida master, bloquea si hay pagos y respalda a vecinos_borrados. */
+$('#delVecinoBtn')?.addEventListener('click', () => {
+  if (!vecinoEditId || ME.rol !== 'master') return;
+  const v = vecinosCache.find(x => x.id === vecinoEditId);
+  $('#vecinoDelInfo').innerHTML = `<b>${esc(v?.domicilio || '')}</b> · ${esc(v?.nombre || '')}`;
+  $('#vecinoDelErr').textContent = '';
+  openSheet('#vecinoDelOverlay');
+});
+$('#vecinoDelCancel')?.addEventListener('click', () => closeSheet('#vecinoDelOverlay'));
+$('#vecinoDelOverlay')?.addEventListener('click', e => { if(e.target.id==='vecinoDelOverlay') closeSheet('#vecinoDelOverlay'); });
+$('#vecinoDelConfirm')?.addEventListener('click', async () => {
+  if (!vecinoEditId || ME.rol !== 'master') return;
+  const btn = $('#vecinoDelConfirm'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/vecinos/borrar', { id: vecinoEditId });
+    toast('Vecino borrado', 'bad');
+    closeSheet('#vecinoDelOverlay');
+    closeSheet('#vecinoOverlay');
+    await refrescarVecinos();
+  } catch(e){
+    $('#vecinoDelErr').textContent = e.message || 'No se pudo borrar';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Sí, borrar';
+  }
+});
+
 /* ====================== FINANZAS ====================== */
 let movType = 'ingreso';
 let finCache = [];      // movimientos de los últimos 6 meses (solo lectura)
@@ -468,25 +605,29 @@ const monthKey = ts => { const d = ts.toDate ? ts.toDate() : new Date(ts); retur
 
 function watchFinanzas(){
   if (unsubFin) unsubFin();
-  if (unsubConfig) unsubConfig();
   const isStaff = (ME.rol==='master' || ME.rol==='admin');
 
-  // Detalle de movimientos, gráficas, morosos y config de casas: solo staff.
-  // Residentes/esclavos ya no leen "finanzas" directo (bloqueado por Firestore
-  // rules) — reciben solo el agregado del Worker, nunca el detalle por casa.
+  // Detalle de movimientos, gráficas y morosos: solo staff. Residentes/esclavos ya no
+  // leen "finanzas" directo (bloqueado por Firestore rules) — reciben solo el agregado
+  // del Worker, nunca el detalle por casa.
   $('#newMovBtn').style.display = isStaff ? 'block' : 'none';
   $('#finCharts').classList.toggle('hidden', !isStaff);
   $('#finActionsMain').classList.toggle('hidden', !isStaff);
   $('#finActionsShare').classList.toggle('hidden', !isStaff);
   $('#morososSection').classList.toggle('hidden', !isStaff);
   $('#finDetalle').classList.toggle('hidden', !isStaff);
-  $('#finConfigBox').classList.toggle('hidden', !isStaff);
 
   finMonths = last6Months();
   const { label } = monthRange();
   $('#finMonth').textContent = 'Finanzas · ' + label;
 
   if (isStaff){
+    // FASE 5: el padrón alimenta termómetro/morosos/dropdown; se recarga al entrar
+    // (y tras cada alta/edición vía refrescarVecinos). No hay lectura directa de vecinos.
+    cargarVecinos().then(() => {
+      renderTermometro(pagaronDelMes(), vecinosActivosCount);
+      renderMorosos();
+    });
     unsubFin = db.collection('finanzas')
       .where('ts','>=',finMonths[0].start)
       .orderBy('ts','desc').limit(1200)
@@ -495,13 +636,6 @@ function watchFinanzas(){
         snap.forEach(doc => finCache.push({ id: doc.id, ...doc.data() }));
         renderFinanzas();
       }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
-
-    unsubConfig = db.collection('config').doc('general').onSnapshot(doc => {
-      CONFIG_GENERAL = doc.exists ? doc.data() : { totalCasas: null };
-      renderConfigCasas();
-      renderTermometro(pagaronDelMes(), CONFIG_GENERAL.totalCasas);
-      renderMorosos();
-    }, err => console.error(err));
   } else {
     loadResumenResidente();
   }
@@ -529,8 +663,8 @@ function renderTermometro(pagaron, totalCasas){
     fill.className = 'therm-fill';
     const isStaff = (ME.rol==='master' || ME.rol==='admin');
     $('#thermText').textContent = isStaff
-      ? 'Configura el número de casas (arriba) para activar el termómetro.'
-      : 'El termómetro aún no está configurado.';
+      ? 'Da de alta vecinos en Gestión para activar el termómetro.'
+      : 'El termómetro aún no está disponible.';
     return;
   }
   const pct = Math.round((pagaron / totalCasas) * 100);
@@ -540,51 +674,55 @@ function renderTermometro(pagaron, totalCasas){
   $('#thermText').textContent = `${pagaron} de ${totalCasas} casas pagaron (${pct}%)`;
 }
 
-/* -------- fuente ÚNICA: casas (número como string) que pagaron Cuota este mes --------
-   Compartida por el termómetro, la lista de morosos y la consulta por casa, para que
-   NUNCA vuelvan a divergir (ese fue el bug de FASE 4.5: el termómetro contaba el set y
-   morosos lo comparaba contra 1..N; con casa de texto libre no casaban). */
-function casasPagadasDelMes(){
+/* -------- fuente ÚNICA: Map(domicilioNorm → pago) de casas que pagaron Cuota este mes.
+   Compartida por termómetro, morosos y "consultar casa" — no vuelven a divergir. El
+   domicilio guardado en finanzas ya es el canónico del padrón; se normaliza igual que en
+   el Worker (MAYÚSCULAS) para casar con vecinosCache. -------- */
+function pagosPorCasaDelMes(){
   const curKey = monthKey(new Date());
-  const set = new Set();
+  const map = new Map();
   finCache.forEach(m => {
     if (m.tipo==='ingreso' && (m.categoria||'')==='Cuota' && monthKey(m.ts)===curKey && m.casa) {
-      set.add(normalizarCasa(m.casa));
+      const k = normDom(m.casa);
+      if (!map.has(k)) map.set(k, m);   // finCache viene desc por ts → conserva el más reciente
     }
   });
-  return set;
+  return map;
 }
-function pagaronDelMes(){ return casasPagadasDelMes().size; }
+function pagaronDelMes(){ return pagosPorCasaDelMes().size; }
 
-/* -------- lista de morosos del mes (solo staff) — colapsable, cerrada por default -------- */
+/* -------- lista de morosos del mes (solo staff) — colapsable, cerrada por default.
+   Universo = vecinos ACTIVOS del padrón (suspendidos no se cobran ni son morosos). -------- */
 let morososExpandido = false;
 function renderMorosos(){
   const list = $('#morososList');
   const countEl = $('#morososCount');
   const toggle = $('#morososToggle');
-  const totalCasas = CONFIG_GENERAL.totalCasas;
 
   poblarConsultaCasa();
 
-  if (!totalCasas){
-    countEl.textContent = 'Configura el número de casas';
-    list.innerHTML = '<div class="empty">Configura el número de casas para ver esta lista</div>';
+  const activos = vecinosActivos();
+  if (!activos.length){
+    countEl.textContent = 'Sin vecinos activos';
+    list.innerHTML = '<div class="empty">Da de alta vecinos en Gestión para ver morosos</div>';
+    list.classList.toggle('hidden', !morososExpandido);
+    toggle.classList.toggle('abierto', morososExpandido);
     return;
   }
 
-  const pagaronSet = casasPagadasDelMes();
-  const casasValidas = Array.from({length: totalCasas}, (_,i) => String(i+1));
-  const morosos = casasValidas.filter(c => !pagaronSet.has(c));
-  const noReconocidos = [...pagaronSet].filter(c => !casasValidas.includes(c));
+  const pagados = pagosPorCasaDelMes();
+  const morosos = activos.filter(v => !pagados.has(v.domicilioNorm));
+  const activosNorm = new Set(activos.map(v => v.domicilioNorm));
+  const noReconocidos = [...pagados.entries()].filter(([k]) => !activosNorm.has(k));
 
   countEl.textContent = `${morosos.length} casa${morosos.length===1?'':'s'} sin pago`;
 
   let html = morosos.length
-    ? morosos.map(c => `<div class="row"><div class="rt"><div class="a">Casa ${esc(c)}</div></div><span class="tag out">Sin pago</span></div>`).join('')
+    ? morosos.map(v => `<div class="row"><div class="rt"><div class="a">${esc(v.domicilio)}</div></div><span class="tag out">Sin pago</span></div>`).join('')
     : '<div class="empty">Todas las casas están al corriente</div>';
   if (noReconocidos.length){
-    html += `<div class="section-title" style="margin-top:14px;font-size:12px">No reconocidos (fuera de 1–${totalCasas})</div>` +
-      noReconocidos.map(c => `<div class="row"><div class="rt"><div class="a">${esc(c)}</div></div><span class="tag">Revisar</span></div>`).join('');
+    html += `<div class="section-title" style="margin-top:14px;font-size:12px">No reconocidos (fuera del padrón activo)</div>` +
+      noReconocidos.map(([,m]) => `<div class="row"><div class="rt"><div class="a">${esc(m.casa)}</div></div><span class="tag">Revisar</span></div>`).join('');
   }
   list.innerHTML = html;
   list.classList.toggle('hidden', !morososExpandido);
@@ -596,74 +734,35 @@ $('#morososToggle').addEventListener('click', () => {
   $('#morososToggle').classList.toggle('abierto', morososExpandido);
 });
 
-/* -------- consultar el estado de una casa específica (solo staff) -------- */
+/* -------- consultar el estado de un domicilio del padrón (solo staff) -------- */
 function poblarConsultaCasa(){
   const sel = $('#consultaCasaSel');
-  const total = CONFIG_GENERAL.totalCasas;
+  const activos = vecinosActivos().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
-  if (!total){ sel.innerHTML = '<option value="">—</option>'; renderConsultaCasa(); return; }
-  let html = '<option value="">Elige una casa…</option>';
-  for (let i = 1; i <= total; i++) html += `<option value="${i}">Casa ${i}</option>`;
-  sel.innerHTML = html;
+  sel.innerHTML = '';
+  if (!activos.length){ sel.appendChild(new Option('—','')); renderConsultaCasa(); return; }
+  sel.appendChild(new Option('Elige un domicilio…',''));
+  activos.forEach(v => sel.appendChild(new Option(v.domicilio, v.domicilio)));   // new Option escapa seguro
   if (prev) sel.value = prev;
-  renderConsultaCasa();   // refresca el resultado con datos en vivo si había casa elegida
+  renderConsultaCasa();
 }
 function renderConsultaCasa(){
   const box = $('#consultaCasaResult');
   const casa = $('#consultaCasaSel').value;
   if (!casa){ box.classList.add('hidden'); box.classList.remove('pagado'); return; }
-  const curKey = monthKey(new Date());
-  const pago = finCache.find(m => m.tipo==='ingreso' && (m.categoria||'')==='Cuota'
-      && monthKey(m.ts)===curKey && normalizarCasa(m.casa)===casa);
+  const pago = pagosPorCasaDelMes().get(normDom(casa));
   box.classList.remove('hidden');
   if (pago){
     box.classList.add('pagado');
-    box.innerHTML = `<div class="a">Casa ${esc(casa)} · <b>pagó</b></div>`
+    box.innerHTML = `<div class="a">${esc(casa)} · <b>pagó</b></div>`
       + `<div class="sub">${esc(pago.folioRecibo||'sin folio')} · ${money(pago.monto)} · ${fmtTime(pago.ts)}</div>`;
   } else {
     box.classList.remove('pagado');
-    box.innerHTML = `<div class="a">Casa ${esc(casa)} · sin pago este mes</div>`
-      + `<div class="sub">No hay Cuota registrada para esta casa en el mes en curso.</div>`;
+    box.innerHTML = `<div class="a">${esc(casa)} · sin pago este mes</div>`
+      + `<div class="sub">No hay Cuota registrada para este domicilio en el mes en curso.</div>`;
   }
 }
 $('#consultaCasaSel').addEventListener('change', renderConsultaCasa);
-
-/* -------- config de número de casas (solo staff) -------- */
-const TOTAL_CASAS_PRESETS = ['50','100','150','200','250','300'];
-function renderConfigCasas(){
-  const sel = $('#totalCasasSel');
-  const custom = $('#totalCasasCustom');
-  const val = CONFIG_GENERAL.totalCasas;
-  if (val && TOTAL_CASAS_PRESETS.includes(String(val))){
-    sel.value = String(val);
-    custom.classList.add('hidden');
-  } else if (val) {
-    sel.value = 'otro';
-    custom.value = val;
-    custom.classList.remove('hidden');
-  } else {
-    sel.value = '100';
-    custom.classList.add('hidden');
-  }
-}
-$('#totalCasasSel').addEventListener('change', () => {
-  $('#totalCasasCustom').classList.toggle('hidden', $('#totalCasasSel').value !== 'otro');
-});
-$('#totalCasasSaveBtn').addEventListener('click', async () => {
-  const sel = $('#totalCasasSel').value;
-  const n = sel === 'otro' ? parseInt($('#totalCasasCustom').value, 10) : parseInt(sel, 10);
-  if (!Number.isInteger(n) || n <= 0) { toast('Número de casas inválido', 'bad'); return; }
-  const btn = $('#totalCasasSaveBtn'); btn.disabled = true;
-  try {
-    await authedFetch('/config/actualizar', { totalCasas: n });
-    toast('Número de casas actualizado', 'ok');
-  } catch(e){
-    console.error(e);
-    toast('No se pudo guardar, intenta más tarde', 'bad');
-    renderConfigCasas(); // regresa el dropdown al valor real de Firestore
-  }
-  finally { btn.disabled = false; }
-});
 
 function groupByMonth(){
   const map = {};
@@ -705,7 +804,7 @@ function renderFinanzas(){
   renderFinCharts(byMonth, curKey);
   populateFiltros();
   filterAndRenderMovs();
-  renderTermometro(pagaronDelMes(), CONFIG_GENERAL.totalCasas);
+  renderTermometro(pagaronDelMes(), vecinosActivosCount);
   renderMorosos();
 }
 
@@ -1046,24 +1145,23 @@ async function borrarMovimiento(m, btn){
 }
 
 /* registrar movimiento (solo staff) */
-const normalizarCasa = s => String(s||'').trim().replace(/\s+/g,' ');
 /* FASE 4.5: casa obligatoria en TODO ingreso — cada recibo queda amarrado a una casa. */
 function casaRequerida(){ return movType==='ingreso'; }
-/* FASE 4.6: el campo Casa es un dropdown numérico 1..totalCasas (leído de config),
-   ya no texto libre — así el valor guardado siempre casa con la lista de morosos. */
+/* FASE 5: el campo Domicilio es un dropdown con los domicilios de vecinos ACTIVOS del
+   padrón (ya no números 1..N ni texto libre) — el Worker revalida contra el padrón. */
 function poblarCasaSelect(){
   const sel = $('#movCasa');
-  const total = CONFIG_GENERAL?.totalCasas;
+  const activos = vecinosActivos().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
-  if (!total){
-    sel.innerHTML = '<option value="">Configura el número de casas primero</option>';
+  sel.innerHTML = '';
+  if (!activos.length){
+    sel.appendChild(new Option('Da de alta vecinos primero',''));
     sel.disabled = true; return;
   }
   sel.disabled = false;
-  let html = '<option value="">Selecciona la casa…</option>';
-  for (let i = 1; i <= total; i++) html += `<option value="${i}">Casa ${i}</option>`;
-  sel.innerHTML = html;
-  if (prev) sel.value = prev;   // conserva selección si sigue en rango
+  sel.appendChild(new Option('Selecciona el domicilio…',''));
+  activos.forEach(v => sel.appendChild(new Option(v.domicilio, v.domicilio)));
+  if (prev) sel.value = prev;   // conserva selección si sigue en el padrón
 }
 function updateCasaField(){
   const req = casaRequerida();
@@ -1471,26 +1569,24 @@ $('#reciboDlBtn').addEventListener('click', async () => {
   } finally { btn.disabled = false; btn.textContent = original; }
 });
 
-/* ====================== FASE 4.5 · REPORTE POR CASA ====================== */
+/* ====================== FASE 4.5 · REPORTE POR CASA (FASE 5: desde el padrón) ====================== */
 $('#casaRepBtn').addEventListener('click', () => {
-  const casas = [...new Set(finCache.filter(m => m.casa).map(m => m.casa))]
-    .sort((a,b) => a.localeCompare(b, 'es', { numeric:true }));
-  $('#casaRepSel').innerHTML =
-    casas.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('') +
-    '<option value="__otra__">Otra…</option>';
-  $('#casaRepCustomField').classList.toggle('hidden', casas.length > 0);
+  const casas = vecinosCache.slice()
+    .sort((a,b) => a.domicilio.localeCompare(b.domicilio, 'es', { numeric:true }))
+    .map(v => v.domicilio);
+  const sel = $('#casaRepSel');
+  sel.innerHTML = '';
+  if (!casas.length){ sel.appendChild(new Option('Sin vecinos en el padrón','')); }
+  else { sel.appendChild(new Option('Elige un domicilio…','')); casas.forEach(c => sel.appendChild(new Option(c, c))); }
+  $('#casaRepCustomField').classList.add('hidden');   // ya no hay texto libre: el padrón es la fuente
   $('#casaRepErr').textContent = '';
   openSheet('#casaRepOverlay');
 });
 $('#casaRepOverlay').addEventListener('click', e => { if (e.target.id==='casaRepOverlay') closeSheet('#casaRepOverlay'); });
-$('#casaRepSel').addEventListener('change', () => {
-  $('#casaRepCustomField').classList.toggle('hidden', $('#casaRepSel').value !== '__otra__');
-});
 
 $('#casaRepGo').addEventListener('click', async () => {
-  const selVal = $('#casaRepSel').value;
-  const casa = normalizarCasa(selVal === '__otra__' || !selVal ? $('#casaRepCustom').value : selVal);
-  if (!casa){ $('#casaRepErr').textContent = 'Indica la casa'; return; }
+  const casa = $('#casaRepSel').value;
+  if (!casa){ $('#casaRepErr').textContent = 'Elige un domicilio'; return; }
   const btn = $('#casaRepGo'); btn.disabled = true; btn.textContent = 'Generando…';
   try {
     // Historial completo de la casa (no solo los 6 meses del cache). Sin orderBy

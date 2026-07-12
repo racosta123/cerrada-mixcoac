@@ -492,7 +492,7 @@ function watchFinanzas(){
       .orderBy('ts','desc').limit(1200)
       .onSnapshot(snap => {
         finCache = [];
-        snap.forEach(doc => finCache.push(doc.data()));
+        snap.forEach(doc => finCache.push({ id: doc.id, ...doc.data() }));
         renderFinanzas();
       }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
 
@@ -959,17 +959,49 @@ function renderMovs(movs){
   movs.forEach(m => {
     const ing = m.tipo==='ingreso';
     const row = document.createElement('div'); row.className = 'row';
+    const folioLinea = (ing && m.folioRecibo) ? `<div class="mov-folio">${esc(m.folioRecibo)}${m.casa ? ' · '+esc(m.casa) : ''}</div>` : '';
     row.innerHTML = `
       <div class="ri"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${ing?'<path d="M12 19V5 M5 12l7-7 7 7"/>':'<path d="M12 5v14 M19 12l-7 7-7-7"/>'}</svg></div>
-      <div class="rt"><div class="a">${esc(m.concepto||m.categoria)}</div><div class="b">${esc(m.categoria)} · ${fmtTime(m.ts)}</div></div>
+      <div class="rt"><div class="a">${esc(m.concepto||m.categoria)}</div><div class="b">${esc(m.categoria)} · ${fmtTime(m.ts)}</div>${folioLinea}</div>
       <span class="mov-amt ${ing?'ok':'bad'}">${ing?'+':'−'}${money(m.monto)}</span>`;
+    if (ing && m.folioRecibo){
+      const act = document.createElement('button');
+      act.className = 'row-act recibo'; act.textContent = 'Recibo';
+      act.addEventListener('click', () => abrirReciboSheet(m));
+      row.appendChild(act);
+    }
+    // Borrar: SOLO master. El Worker respalda el doc en finanzas_borrados antes de eliminar.
+    if (ME.rol === 'master'){
+      const del = document.createElement('button');
+      del.className = 'row-act danger'; del.textContent = 'Borrar';
+      del.addEventListener('click', () => borrarMovimiento(m, del));
+      row.appendChild(del);
+    }
     list.appendChild(row);
   });
 }
 
+/* Borrado de un movimiento (solo master). Confirmación explícita porque es
+   destructivo; el snapshot de watchFinanzas redibuja la lista al eliminarse. */
+async function borrarMovimiento(m, btn){
+  const detalle = `${m.tipo==='ingreso'?'+':'−'}${money(m.monto)} · ${m.concepto||m.categoria}` +
+    (m.folioRecibo ? ` · ${m.folioRecibo}` : '');
+  if (!confirm(`¿Borrar este movimiento?\n\n${detalle}\n\nSe conserva un respaldo, pero desaparece del reporte.`)) return;
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/finanzas/borrar', { id: m.id });
+    toast('Movimiento borrado', 'bad');
+    // La lista se actualiza sola por el onSnapshot de finanzas.
+  } catch(e){
+    toast(e.message || 'No se pudo borrar', 'bad');
+    btn.disabled = false; btn.textContent = 'Borrar';
+  }
+}
+
 /* registrar movimiento (solo staff) */
 const normalizarCasa = s => String(s||'').trim().replace(/\s+/g,' ');
-function casaRequerida(){ return movType==='ingreso' && $('#movCat').value==='Cuota'; }
+/* FASE 4.5: casa obligatoria en TODO ingreso — cada recibo queda amarrado a una casa. */
+function casaRequerida(){ return movType==='ingreso'; }
 function updateCasaField(){
   $('#movCasaField').classList.toggle('hidden', !casaRequerida());
 }
@@ -991,14 +1023,22 @@ async function saveMov(){
   const casa = normalizarCasa($('#movCasa').value);
   $('#movErr').textContent = '';
   if (!concepto || !(monto > 0)){ $('#movErr').textContent = 'Falta concepto o monto válido'; return; }
-  if (casaRequerida() && !casa){ $('#movErr').textContent = 'Falta el número de casa (obligatorio para cuotas)'; return; }
+  if (casaRequerida() && !casa){ $('#movErr').textContent = 'Falta el número de casa (obligatorio en ingresos)'; return; }
   const btn = $('#saveMovBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
     // El movimiento lo escribe el Worker tras verificar rol master/admin.
-    await authedFetch('/finanzas/registrar', { tipo: movType, concepto, categoria, monto, casa });
+    // En ingresos el Worker además asigna el folio consecutivo del recibo.
+    const r = await authedFetch('/finanzas/registrar', { tipo: movType, concepto, categoria, monto, casa });
     toast('Movimiento registrado', 'ok');
     closeSheet('#movOverlay');
     $('#movConcept').value = $('#movCat').value = $('#movAmount').value = $('#movCasa').value = '';
+    if (r && r.folioRecibo){
+      abrirReciboSheet({
+        id: r.id, folioRecibo: r.folioRecibo,
+        tipo: movType, concepto, categoria, monto, casa,
+        creadoNombre: ME.nombre || '', ts: new Date(),
+      });
+    }
   } catch(e){ $('#movErr').textContent = e.message || 'No se pudo guardar'; }
   finally { btn.disabled = false; btn.textContent = 'Guardar movimiento'; }
 }
@@ -1243,6 +1283,244 @@ async function compartirReportePDF(){
   }
 }
 $('#waBtn').addEventListener('click', compartirReportePDF);
+
+/* ====================== FASE 4.5 · RECIBOS DE PAGO ====================== */
+function tsADate(ts){ return ts && ts.toDate ? ts.toDate() : new Date(ts); }
+
+/* Recibo individual, una página carta, misma identidad tipográfica de FASE 0
+   (filete dorado, eyebrow espaciado, folio a la derecha, montos en courier). */
+function construirReciboPDF(mov){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'pt', format:'letter' });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = PDF.MARGIN;
+  const fecha = tsADate(mov.ts).toLocaleString('es-MX', { day:'2-digit', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit' });
+
+  doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
+  let y = M - 10;
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+  doc.text('R E C I B O   D E   P A G O', M, y + 14);
+  doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
+  doc.text('Cerrada Mixcoac', M, y + 42);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+  doc.text(`Folio: ${mov.folioRecibo}`, W - M, y + 10, { align:'right' });
+  doc.setTextColor(...PDF.notes);
+  doc.text(`Emitido: ${fecha}`, W - M, y + 22, { align:'right' });
+
+  y += 58; doc.setDrawColor(...PDF.grid); doc.line(M, y, W - M, y); y += 30;
+
+  const boxH = 88;
+  doc.setDrawColor(...PDF.grid); doc.setFillColor(255,255,255);
+  doc.roundedRect(M, y, W - 2*M, boxH, 8, 8, 'FD');
+  doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+  doc.text('MONTO RECIBIDO', M + 18, y + 24);
+  doc.setFont('courier','bold'); doc.setFontSize(30); doc.setTextColor(...PDF.green);
+  doc.text(money(mov.monto), W - M - 18, y + 58, { align:'right' });
+  y += boxH + 34;
+
+  const filas = [
+    ['CASA', mov.casa || '—'],
+    ['CONCEPTO', mov.concepto || '—'],
+    ['CATEGORÍA', mov.categoria || 'Otro'],
+    ['FECHA Y HORA', fecha],
+    ['REGISTRÓ', mov.creadoNombre || '—'],
+  ];
+  filas.forEach(([k, v]) => {
+    doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+    doc.text(k, M, y);
+    doc.setFont('helvetica','normal'); doc.setFontSize(11); doc.setTextColor(...PDF.text);
+    doc.text(String(v).slice(0, 90), M + 140, y);
+    doc.setDrawColor(...PDF.grid); doc.setLineWidth(0.5);
+    doc.line(M, y + 8, W - M, y + 8);
+    y += 28;
+  });
+
+  doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
+  doc.text('Recibo oficial · Cerrada Mixcoac · Transparencia vecinal', M, H - 24);
+  doc.text(`${mov.folioRecibo} · Página 1 de 1`, W - M, H - 24, { align:'right' });
+
+  return { doc, filename: `Recibo-${mov.folioRecibo}.pdf` };
+}
+
+let reciboActual = null;
+function abrirReciboSheet(mov){
+  reciboActual = mov;
+  $('#reciboTitle').textContent = `Recibo ${mov.folioRecibo}`;
+  $('#reciboErr').textContent = '';
+  $('#reciboDatos').innerHTML =
+    `<b>${esc(mov.casa || '—')}</b> · ${esc(mov.concepto || '')}<br>` +
+    `${esc(mov.categoria || 'Otro')} · ${money(mov.monto)} · ${fmtTime(mov.ts)}`;
+  openSheet('#reciboOverlay');
+}
+$('#reciboOverlay').addEventListener('click', e => { if (e.target.id==='reciboOverlay') closeSheet('#reciboOverlay'); });
+
+/* Marca envío/descarga en el movimiento (vía Worker). Si falla no bloquea:
+   el recibo ya salió; solo se avisa que la marca no quedó registrada. */
+async function marcarReciboEnviado(id, accion){
+  try { await authedFetch('/finanzas/marcar-recibo', { id, accion }); }
+  catch(e){ console.error('marcarRecibo', e); toast('Recibo ok, pero no se registró el envío', 'bad'); }
+}
+
+/* Compartir por WhatsApp: Web Share nivel 2, mismo patrón FASE 1 — sin awaits entre
+   generar el PDF y navigator.share() para no perder el gesto de usuario en móviles. */
+$('#reciboWaBtn').addEventListener('click', async () => {
+  const mov = reciboActual; if (!mov) return;
+  const btn = $('#reciboWaBtn'); const original = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    const { doc, filename } = construirReciboPDF(mov);
+    const file = new File([doc.output('blob')], filename, { type:'application/pdf' });
+    if (navigator.canShare && navigator.canShare({ files:[file] })){
+      await navigator.share({ files:[file], title:`Recibo ${mov.folioRecibo} · Cerrada Mixcoac` });
+      toast('Recibo compartido', 'ok');
+      await marcarReciboEnviado(mov.id, 'compartido');
+    } else {
+      doc.save(filename);
+      toast('PDF descargado — adjúntalo en WhatsApp', 'ok');
+      await marcarReciboEnviado(mov.id, 'descargado');
+    }
+  } catch(e){
+    if (e && e.name === 'AbortError'){
+      // el usuario cerró el panel de compartir; no es un error real.
+    } else {
+      console.error('compartirRecibo', e);
+      $('#reciboErr').textContent = 'No se pudo generar el recibo';
+    }
+  } finally { btn.disabled = false; btn.textContent = original; }
+});
+
+/* Plan B siempre visible: descarga directa (Web Share falla a veces en iOS). */
+$('#reciboDlBtn').addEventListener('click', async () => {
+  const mov = reciboActual; if (!mov) return;
+  const btn = $('#reciboDlBtn'); const original = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    const { doc, filename } = construirReciboPDF(mov);
+    doc.save(filename);
+    toast('Recibo descargado', 'ok');
+    await marcarReciboEnviado(mov.id, 'descargado');
+  } catch(e){
+    console.error('descargarRecibo', e);
+    $('#reciboErr').textContent = 'No se pudo generar el recibo';
+  } finally { btn.disabled = false; btn.textContent = original; }
+});
+
+/* ====================== FASE 4.5 · REPORTE POR CASA ====================== */
+$('#casaRepBtn').addEventListener('click', () => {
+  const casas = [...new Set(finCache.filter(m => m.casa).map(m => m.casa))]
+    .sort((a,b) => a.localeCompare(b, 'es', { numeric:true }));
+  $('#casaRepSel').innerHTML =
+    casas.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('') +
+    '<option value="__otra__">Otra…</option>';
+  $('#casaRepCustomField').classList.toggle('hidden', casas.length > 0);
+  $('#casaRepErr').textContent = '';
+  openSheet('#casaRepOverlay');
+});
+$('#casaRepOverlay').addEventListener('click', e => { if (e.target.id==='casaRepOverlay') closeSheet('#casaRepOverlay'); });
+$('#casaRepSel').addEventListener('change', () => {
+  $('#casaRepCustomField').classList.toggle('hidden', $('#casaRepSel').value !== '__otra__');
+});
+
+$('#casaRepGo').addEventListener('click', async () => {
+  const selVal = $('#casaRepSel').value;
+  const casa = normalizarCasa(selVal === '__otra__' || !selVal ? $('#casaRepCustom').value : selVal);
+  if (!casa){ $('#casaRepErr').textContent = 'Indica la casa'; return; }
+  const btn = $('#casaRepGo'); btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    // Historial completo de la casa (no solo los 6 meses del cache). Sin orderBy
+    // encadenado al where para no requerir índice compuesto — se ordena aquí.
+    const snap = await db.collection('finanzas').where('casa','==',casa).get();
+    const movs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .filter(m => m.tipo === 'ingreso')
+      .sort((a,b) => tsADate(b.ts) - tsADate(a.ts));
+    if (!movs.length){ $('#casaRepErr').textContent = `Sin pagos registrados para "${casa}"`; return; }
+    const { doc, filename } = construirReporteCasaPDF(casa, movs);
+    doc.save(filename);
+    toast('Reporte descargado', 'ok');
+    closeSheet('#casaRepOverlay');
+  } catch(e){
+    console.error('reporteCasa', e);
+    $('#casaRepErr').textContent = 'No se pudo generar el reporte';
+  } finally { btn.disabled = false; btn.textContent = 'Generar PDF'; }
+});
+
+/* Historial de pagos de una casa, identidad FASE 0. Cada pago referencia su folio
+   de recibo y la fecha de envío/descarga — el soporte para aclaraciones. */
+function construirReporteCasaPDF(casa, movs){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'pt', format:'letter' });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = PDF.MARGIN;
+  const generadoEl = new Date().toLocaleString('es-MX', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+  const total = movs.reduce((a,m) => a + (m.monto || 0), 0);
+
+  doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
+  let y = M - 10;
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+  doc.text('H I S T O R I A L   D E   P A G O S', M, y + 14);
+  doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
+  doc.text('Cerrada Mixcoac', M, y + 42);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+  doc.text(`Casa: ${casa}`, W - M, y + 10, { align:'right' });
+  doc.setTextColor(...PDF.notes);
+  doc.text(`Generado: ${generadoEl}`, W - M, y + 22, { align:'right' });
+  doc.text(`${movs.length} pago(s)`, W - M, y + 34, { align:'right' });
+
+  y += 58; doc.setDrawColor(...PDF.grid); doc.line(M, y, W - M, y); y += 24;
+
+  const fmtEnvio = m => {
+    const ts = m.reciboCompartidoTs || m.reciboDescargadoTs;
+    if (!ts) return '—';
+    const cuando = tsADate(ts).toLocaleString('es-MX', { day:'2-digit', month:'short', year:'2-digit', hour:'2-digit', minute:'2-digit' });
+    return (m.reciboCompartidoTs ? 'Enviado ' : 'Descargado ') + cuando;
+  };
+
+  doc.autoTable({
+    startY: y,
+    head: [['Fecha','Concepto','Categoría','Folio recibo','Recibo enviado','Monto']],
+    body: movs.map(m => [
+      fmtTime(m.ts),
+      (m.concepto || '—').slice(0, 40),
+      m.categoria || 'Otro',
+      m.folioRecibo || '—',
+      fmtEnvio(m),
+      '+' + money(m.monto),
+    ]),
+    foot: [['', '', '', '', 'Total pagado', '+' + money(total)]],
+    theme:'plain',
+    styles:{ font:'helvetica', fontSize:8.5, textColor: PDF.text, cellPadding:6, lineColor: PDF.grid, lineWidth:0.5 },
+    headStyles:{ fillColor:[255,255,255], textColor: PDF.secondary, fontStyle:'bold', fontSize:8, lineColor: PDF.text },
+    alternateRowStyles:{ fillColor: PDF.zebra },
+    columnStyles:{ 3:{ font:'courier' }, 5:{ halign:'right', font:'courier', fontStyle:'bold', textColor: PDF.green } },
+    margin:{ left:M, right:M, bottom: 50 },
+    didParseCell(data){
+      if (data.section === 'foot'){
+        data.cell.styles.fontStyle = 'bold';
+        data.cell.styles.textColor = PDF.text;
+        if (data.column.index === 5){ data.cell.styles.font = 'courier'; data.cell.styles.halign = 'right'; }
+      }
+    },
+    didDrawCell(data){
+      if (data.section === 'foot' && data.row.index === 0 && data.column.index === 0){
+        doc.setDrawColor(...PDF.text); doc.setLineWidth(0.6);
+        doc.line(M, data.cell.y, W - M, data.cell.y);
+        doc.line(M, data.cell.y + 2, W - M, data.cell.y + 2);
+      }
+    },
+  });
+
+  const totalPages = doc.internal.getNumberOfPages();
+  for (let p = 1; p <= totalPages; p++){
+    doc.setPage(p);
+    doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
+    doc.text('Historial de pagos oficial · Cerrada Mixcoac · Transparencia vecinal', M, H - 24);
+    doc.text(`${casa} · Página ${p} de ${totalPages}`, W - M, H - 24, { align:'right' });
+  }
+
+  return { doc, filename: `Pagos-${casa.replace(/\s+/g,'-')}-Mixcoac.pdf` };
+}
 
 function openSheet(sel){ $(sel).classList.add('open'); }
 function closeSheet(sel){ $(sel).classList.remove('open'); }

@@ -43,6 +43,8 @@ export default {
         case '/validar-qr':        out = await validarQR(req, env); break;  // lo llama el lector físico
         case '/finanzas/registrar': out = await registrarFinanza(req, env); break;
         case '/finanzas/resumen':  out = await resumenFinanzas(req, env); break;
+        case '/finanzas/marcar-recibo': out = await marcarRecibo(req, env); break;
+        case '/finanzas/borrar':   out = await borrarFinanza(req, env); break;
         case '/config/actualizar': out = await actualizarConfig(req, env); break;
         case '/usuarios/crear':    out = await crearUsuario(req, env); break;
         case '/usuarios/suspender': out = await suspenderUsuario(req, env); break;
@@ -188,11 +190,14 @@ async function registrarFinanza(req, env) {
 
   const cat = String(categoria||'Otro').slice(0,40);
   const casaNorm = normalizarCasa(casa).slice(0,40);
-  // El campo Casa es obligatorio SOLO para cuotas de ingreso — es la llave que
-  // alimenta el termómetro de recaudación y la lista de morosos.
-  if (tipo === 'ingreso' && cat === 'Cuota' && !casaNorm) {
-    throw httpErr(400, 'Falta el número/identificador de casa para una cuota');
+  // Casa obligatoria en TODO ingreso (FASE 4.5): cada recibo queda amarrado a una
+  // casa, y las cuotas además alimentan el termómetro y la lista de morosos.
+  if (tipo === 'ingreso' && !casaNorm) {
+    throw httpErr(400, 'Falta el número/identificador de casa para un ingreso');
   }
+
+  // Los ingresos llevan recibo: folio consecutivo del mes, asignado de forma atómica.
+  const folioRecibo = tipo === 'ingreso' ? await siguienteFolioRecibo(env) : '';
 
   const id = crypto.randomUUID();
   await firestoreSet(env, `finanzas/${id}`, {
@@ -201,10 +206,89 @@ async function registrarFinanza(req, env) {
     categoria:{stringValue:cat},
     monto:{doubleValue:m},
     casa:{stringValue:casaNorm},
+    ...(folioRecibo ? { folioRecibo:{stringValue:folioRecibo} } : {}),
     creadoPor:{stringValue:user.uid},
     creadoNombre:{stringValue:perfil.nombre||''},
     ts:{timestampValue:new Date().toISOString()},
   });
+  return json({ ok:true, id, folioRecibo });
+}
+
+/* folio consecutivo atómico REC-YYYYMM-### — un solo commit con updateTransforms
+   (increment) sobre config/folios: Firestore aplica el +1 de forma atómica y
+   devuelve el valor resultante en transformResults, sin transacción explícita ni
+   carreras entre registros simultáneos. El contador reinicia cada mes (campo
+   rec_YYYYMM nuevo). config/folios está bajo match /config → solo el Worker escribe. */
+async function siguienteFolioRecibo(env) {
+  const now = new Date();
+  const ym = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}`;
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const base = `projects/${env.FIREBASE_PROJECT}/databases/(default)`;
+  const r = await fetch(`https://firestore.googleapis.com/v1/${base}/documents:commit`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({
+      writes: [{
+        // update con máscara vacía = merge que crea el doc si no existe;
+        // el increment va aparte en updateTransforms.
+        update: { name: `${base}/documents/config/folios`, fields: {} },
+        updateMask: { fieldPaths: [] },
+        updateTransforms: [{ fieldPath: `rec_${ym}`, increment: { integerValue: '1' } }],
+      }],
+    }),
+  });
+  if (!r.ok) throw httpErr(500, 'No se pudo asignar folio');
+  const d = await r.json();
+  const n = Number(d.writeResults?.[0]?.transformResults?.[0]?.integerValue);
+  if (!Number.isInteger(n) || n <= 0) throw httpErr(500, 'No se pudo asignar folio');
+  return `REC-${ym}-${String(n).padStart(3,'0')}`;
+}
+
+/* ============ /finanzas/marcar-recibo — solo master/admin ============
+   Marca en el movimiento cuándo se compartió o descargó su recibo, para que el
+   reporte por casa pueda referenciar "enviado el ...". Solo toca ese campo. */
+async function marcarRecibo(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo master/admin');
+
+  const { id, accion } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  if (!['compartido','descargado'].includes(accion)) throw httpErr(400, 'accion inválida');
+
+  const campo = accion === 'compartido' ? 'reciboCompartidoTs' : 'reciboDescargadoTs';
+  await firestoreActualizarCampos(env, `finanzas/${id}`, {
+    [campo]:{timestampValue:new Date().toISOString()},
+  });
+  return json({ ok:true, id, [campo]: true });
+}
+
+/* ============ /finanzas/borrar — SOLO master ============
+   Para errores de captura y pruebas. Antes de borrar copia el documento completo a
+   finanzas_borrados/{id} con quién y cuándo (auditoría; sin match en las reglas →
+   ilegible para clientes, visible solo en la consola de Firebase / vía Worker). */
+async function borrarFinanza(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master borra movimientos');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const rGet = await fetch(`${fsBase(env)}/finanzas/${id}`, { headers:{ Authorization:'Bearer '+at } });
+  if (rGet.status === 404) throw httpErr(404, 'Movimiento no existe');
+  if (!rGet.ok) throw httpErr(500, 'Firestore get falló');
+  const docActual = await rGet.json();
+
+  await firestoreSet(env, `finanzas_borrados/${id}`, {
+    ...(docActual.fields || {}),
+    borradoPor:{stringValue:user.uid},
+    borradoNombre:{stringValue:perfil.nombre||''},
+    borradoTs:{timestampValue:new Date().toISOString()},
+  }, at);
+
+  const rDel = await fetch(`${fsBase(env)}/finanzas/${id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  if (!rDel.ok) throw httpErr(500, 'Firestore delete falló');
   return json({ ok:true, id });
 }
 
@@ -432,6 +516,18 @@ async function firestoreUpdate(env, path, fields, mask) {
     method:'PATCH', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
     body: JSON.stringify({ fields }),
   });
+}
+/* Como firestoreUpdate pero estricto: máscara derivada de los campos, exige que el
+   documento exista (no crea fantasmas si el id es inválido) y truena con error claro. */
+async function firestoreActualizarCampos(env, path, fields) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const qs = Object.keys(fields).map(f=>`updateMask.fieldPaths=${encodeURIComponent(f)}`).join('&');
+  const r = await fetch(`${fsBase(env)}/${path}?${qs}&currentDocument.exists=true`, {
+    method:'PATCH', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (r.status === 404 || r.status === 400) throw httpErr(404, 'Movimiento no existe');
+  if (!r.ok) throw httpErr(500, 'Firestore update falló');
 }
 async function logApertura(env, o) {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');

@@ -208,6 +208,10 @@
   }
   .overlay.open .sheet{transform:translateY(0)}
   .sheet h3{margin:4px 0 18px;font-size:18px;font-weight:600}
+  .recibo-datos{background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:16px;font-size:14px;line-height:1.7}
+  .recibo-datos b{color:var(--gold, #d4af37)}
+  .mov-folio{font-size:11px;color:var(--muted-2);letter-spacing:.4px}
+  .row-act.recibo{white-space:nowrap}
   .grab{width:42px;height:4px;border-radius:3px;background:var(--line);margin:0 auto 16px}
   .seg{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
   .seg button{
@@ -371,6 +375,7 @@
     </div>
     <div id="finActionsShare" class="fin-actions">
       <button class="btn-ghost" id="waBtn">📱 Compartir reporte</button>
+      <button class="btn-ghost" id="casaRepBtn">Reporte por casa</button>
     </div>
     <div id="morososSection">
       <div class="section-title">Morosos del mes</div>
@@ -469,10 +474,36 @@
         <option value="Otro">Otro</option>
       </select>
     </div>
-    <div class="field hidden" id="movCasaField"><label>Casa (obligatorio para cuotas)</label><input id="movCasa" placeholder="Ej. 57"></div>
+    <div class="field hidden" id="movCasaField"><label>Casa (obligatorio en ingresos)</label><input id="movCasa" placeholder="Ej. 57"></div>
     <div class="field"><label>Monto (MXN)</label><input id="movAmount" type="number" inputmode="decimal" placeholder="0.00"></div>
     <button class="btn-primary" id="saveMovBtn">Guardar movimiento</button>
     <div id="movErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ RECIBO SHEET (FASE 4.5) ============ -->
+<div class="overlay" id="reciboOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3 id="reciboTitle">Recibo generado</h3>
+    <div class="recibo-datos" id="reciboDatos"></div>
+    <button class="btn-primary" id="reciboWaBtn">📱 Compartir por WhatsApp</button>
+    <button class="btn-ghost" id="reciboDlBtn">Descargar PDF</button>
+    <div id="reciboErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ REPORTE POR CASA SHEET (FASE 4.5) ============ -->
+<div class="overlay" id="casaRepOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3>Reporte por casa</h3>
+    <div class="field"><label>Casa</label>
+      <select id="casaRepSel"></select>
+    </div>
+    <div class="field hidden" id="casaRepCustomField"><label>Casa exacta</label><input id="casaRepCustom" placeholder="Ej. 57"></div>
+    <button class="btn-primary" id="casaRepGo">Generar PDF</button>
+    <div id="casaRepErr" class="err"></div>
   </div>
 </div>
 

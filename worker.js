@@ -43,6 +43,7 @@ export default {
         case '/validar-qr':        out = await validarQR(req, env); break;  // lo llama el lector físico
         case '/finanzas/registrar': out = await registrarFinanza(req, env); break;
         case '/finanzas/resumen':  out = await resumenFinanzas(req, env); break;
+        case '/finanzas/cobranza': out = await cobranzaFinanzas(req, env); break;
         case '/finanzas/marcar-recibo': out = await marcarRecibo(req, env); break;
         case '/finanzas/borrar':   out = await borrarFinanza(req, env); break;
         case '/vecinos/crear':     out = await crearVecino(req, env); break;
@@ -55,6 +56,15 @@ export default {
         case '/usuarios/crear':    out = await crearUsuario(req, env); break;
         case '/usuarios/suspender': out = await suspenderUsuario(req, env); break;
         case '/usuarios/borrar':   out = await borrarUsuario(req, env); break;
+        case '/personas/crear':     out = await crearPersona(req, env); break;
+        case '/personas/actualizar': out = await actualizarPersona(req, env); break;
+        case '/personas/suspender': out = await suspenderPersona(req, env); break;
+        case '/personas/reactivar': out = await reactivarPersona(req, env); break;
+        case '/personas/borrar':    out = await borrarPersona(req, env); break;
+        case '/personas/listar':    out = await listarPersonas(req, env); break;
+        case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
+        case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
+        case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -260,8 +270,9 @@ async function registrarFinanza(req, env) {
     const dom = String(casa == null ? '' : casa).trim().replace(/\s+/g, ' ');
     if (!dom) throw httpErr(400, 'Falta el domicilio para un ingreso');
     const domNorm = normDomicilio(dom);
-    const vecinos = (await firestoreList(env, 'vecinos')).map(d => readDoc(d.fields));
-    const match = vecinos.find(v => v.domicilioNorm === domNorm && (v.estado || 'activo') === 'activo');
+    // FASE 6.5: la casa debe ser un JEFE de familia activo del padrón de personas.
+    const jefes = (await personasList(env)).filter(p => esJefe(p) && (p.estado || 'activo') === 'activo');
+    const match = jefes.find(j => j.domicilioNorm === domNorm);
     if (!match) throw httpErr(400, `Domicilio no registrado o suspendido: "${dom}"`);
     casaCanon = match.domicilio;
   }
@@ -592,43 +603,112 @@ async function crearInvitacionRegistro(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff genera invitaciones');
 
-  const { vecinoId } = await req.json();
-  if (!vecinoId || !/^[A-Za-z0-9-]{10,64}$/.test(vecinoId)) throw httpErr(400, 'vecinoId inválido');
+  const { personaId } = await req.json();
+  if (!personaId || !/^[A-Za-z0-9-]{10,64}$/.test(personaId)) throw httpErr(400, 'personaId inválido');
 
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
-  const rGet = await fetch(`${fsBase(env)}/vecinos/${vecinoId}`, { headers:{ Authorization:'Bearer '+at } });
-  if (rGet.status === 404) throw httpErr(404, 'Vecino no existe');
-  if (!rGet.ok) throw httpErr(500, 'Firestore get falló');
-  const vecino = readDoc((await rGet.json()).fields);
-  if ((vecino.estado || 'activo') !== 'activo') throw httpErr(409, 'El vecino no está activo');
-  if (vecino.uid) throw httpErr(409, 'El vecino ya tiene una cuenta vinculada');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const persona = byId[personaId];
+  if (!persona) throw httpErr(404, 'Persona no existe');
+  if ((persona.estado || 'activo') !== 'activo') throw httpErr(409, 'La persona no está activa');
+  if (persona.uid) throw httpErr(409, 'Esta persona ya tiene una cuenta');
+  if (persona.jefeId) throw httpErr(400, 'A un familiar lo invita su jefe, no staff');
 
-  // Solo una invitación viva a la vez: borra las previas no usadas de este vecino.
+  const t = await emitirInvitacion(env, at, { persona, byId, creadoPor: user.uid });
+  return json({ ok:true, token: t.token, expiraEn: t.expiraEn });
+}
+
+/* /invitaciones/familiar — el JEFE (residente activo con cuenta) invita a un familiar.
+   Crea la persona familiar (Sin cuenta, hereda domicilio del jefe) + token. ≤5 familiares
+   vivos validado AQUÍ (server-side). Familiar y suspendido NO pueden invitar. */
+async function crearInvitacionFamiliar(req, env) {
+  const user = await requireAuth(req, env);
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const jefe = all.find(p => p.uid === user.uid);
+  if (!jefe) throw httpErr(403, 'Sin perfil');
+  if (!esJefe(jefe)) throw httpErr(403, 'Solo un jefe de familia puede invitar familiares');
+  if ((jefe.estado || 'activo') !== 'activo') throw httpErr(403, 'Tu cuenta está suspendida; no puedes invitar');
+
+  const { nombre, telefono } = await req.json();
+  const nom = String(nombre || '').trim().slice(0, 80);
+  const tel = String(telefono || '').trim().slice(0, 30);
+  if (!nom) throw httpErr(400, 'Falta el nombre del familiar');
+  if (!tel) throw httpErr(400, 'El teléfono es obligatorio');
+
+  // Límite de 5 familiares VIVOS (los suspendidos ocupan slot).
+  if (all.filter(p => p.jefeId === jefe.id).length >= 5) throw httpErr(409, 'Ya alcanzaste el máximo de 5 familiares');
+
+  const fid = crypto.randomUUID();
+  await firestoreSet(env, `personas/${fid}`, {
+    nombre:{stringValue:nom},
+    telefono:{stringValue:tel},
+    correo:{nullValue:null},
+    domicilio:{stringValue:''},          // familiar NO guarda domicilio: se DERIVA del jefe
+    domicilioNorm:{stringValue:''},
+    rol:{stringValue:'residente'},
+    estado:{stringValue:'activo'},
+    uid:{nullValue:null},
+    jefeId:{stringValue:jefe.id},
+    suspendidoPor:{nullValue:null},
+    creadoPor:{stringValue:user.uid},
+    creadoEn:{timestampValue:new Date().toISOString()},
+  }, at);
+
+  const persona = { id: fid, nombre: nom, jefeId: jefe.id, rol:'residente' };
+  byId[fid] = persona;
+  const t = await emitirInvitacion(env, at, { persona, byId, creadoPor: user.uid });
+  return json({ ok:true, familiarId: fid, token: t.token, expiraEn: t.expiraEn });
+}
+
+/* Emite un token de un uso para una persona: invalida los previos no usados de esa persona
+   (solo una viva a la vez) y guarda el hash + datos denormalizados (nombre + domicilio
+   resuelto para mostrar). Devuelve el token en claro UNA sola vez. */
+async function emitirInvitacion(env, at, { persona, byId, creadoPor }) {
   const previas = (await firestoreList(env, 'registro_invitaciones'))
-    .filter(d => { const x = readDoc(d.fields); return x.vecinoId === vecinoId && !x.usado; });
+    .filter(d => { const x = readDoc(d.fields); return x.personaId === persona.id && !x.usado; });
   for (const d of previas) {
-    const pid = d.name.split('/').pop();
-    await fetch(`${fsBase(env)}/registro_invitaciones/${pid}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+    await fetch(`${fsBase(env)}/registro_invitaciones/${d.name.split('/').pop()}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
   }
-
-  // Token aleatorio de 32 bytes (256 bits). Solo su hash se persiste (como id del doc).
   const token = bytesToB64url(crypto.getRandomValues(new Uint8Array(32)));
   const hash = await sha256b64url(token);
   const expiraEn = new Date(Date.now() + 72 * 3600 * 1000).toISOString();
-
   await firestoreSet(env, `registro_invitaciones/${hash}`, {
     hashToken:{stringValue:hash},
-    vecinoId:{stringValue:vecinoId},
-    domicilio:{stringValue:vecino.domicilio || ''},
-    nombre:{stringValue:vecino.nombre || ''},
-    creadoPor:{stringValue:user.uid},
+    personaId:{stringValue:persona.id},
+    domicilio:{stringValue: domicilioDe(persona, byId)},
+    nombre:{stringValue: persona.nombre || ''},
+    creadoPor:{stringValue: creadoPor},
     creadoEn:{timestampValue:new Date().toISOString()},
     expiraEn:{timestampValue:expiraEn},
     usado:{booleanValue:false},
     usadoEn:{nullValue:null},
   }, at);
+  return { token, expiraEn };
+}
 
-  return json({ ok:true, token, expiraEn });
+/* /personas/familiar-cancelar — el JEFE elimina a un familiar suyo que sigue "Sin cuenta"
+   (invitado pero nunca registrado), liberando el slot; invalida sus invitaciones vivas. */
+async function cancelarFamiliar(req, env) {
+  const user = await requireAuth(req, env);
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const jefe = all.find(p => p.uid === user.uid);
+  if (!jefe || !esJefe(jefe)) throw httpErr(403, 'Solo un jefe puede cancelar a sus familiares');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const fam = all.find(p => p.id === id);
+  if (!fam || fam.jefeId !== jefe.id) throw httpErr(404, 'Ese familiar no es tuyo');
+  if (fam.uid) throw httpErr(409, 'Ese familiar ya tiene cuenta; no se puede cancelar aquí');
+
+  for (const iv of (await firestoreList(env, 'registro_invitaciones')).filter(d => { const x = readDoc(d.fields); return x.personaId === id && !x.usado; })) {
+    await fetch(`${fsBase(env)}/registro_invitaciones/${iv.name.split('/').pop()}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(()=>{});
+  }
+  await fetch(`${fsBase(env)}/personas/${id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  return json({ ok:true, id });
 }
 
 /* /invitaciones/validar — PÚBLICO (token-gated). Solo revela nombre + domicilio.
@@ -657,8 +737,15 @@ async function completarInvitacionRegistro(req, env) {
   const inv = await leerInvitacionValida(env, at, token);
   if (!inv) throw httpErr(400, 'Invitación inválida o expirada');
 
-  // 1) QUEMA-PRIMERO con compare-and-set (precondición updateTime). Un 412 = otro request
-  //    ya lo quemó en la carrera → un solo uso garantizado.
+  // La persona debe seguir viva, activa y sin cuenta. rol/domicilio/jefeId salen del doc.
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const persona = byId[inv.x.personaId];
+  if (!persona) throw httpErr(409, 'La invitación ya no es válida');
+  if (persona.uid) throw httpErr(409, 'Esta persona ya tiene una cuenta');
+  if ((persona.estado || 'activo') !== 'activo') throw httpErr(409, 'Esta persona está suspendida');
+
+  // 1) QUEMA-PRIMERO con compare-and-set (precondición updateTime). 412 = otro ya lo quemó.
   const burnUrl = `${fsBase(env)}/registro_invitaciones/${inv.hash}`
     + `?updateMask.fieldPaths=usado&updateMask.fieldPaths=usadoEn`
     + `&currentDocument.updateTime=${encodeURIComponent(inv.updateTime)}`;
@@ -676,11 +763,10 @@ async function completarInvitacionRegistro(req, env) {
     }).catch(()=>{});
   };
 
-  // 2) Crear la cuenta de Auth. Si el correo ya existe, se revierte el quemado (no se
-  //    consume el token) y se avisa claro.
+  // 2) Crear la cuenta de Auth (nombre del padrón). Si el correo ya existe, revertir.
   const res = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts`, {
     method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
-    body: JSON.stringify({ email: correo, password: pass, displayName: inv.x.nombre || '', emailVerified:false }),
+    body: JSON.stringify({ email: correo, password: pass, displayName: persona.nombre || '', emailVerified:false }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -692,16 +778,284 @@ async function completarInvitacionRegistro(req, env) {
   }
   const { localId } = await res.json();
 
-  // 3) Perfil de login (rol/casa desde el vecino) + vínculo uid en el doc del vecino.
-  await firestoreSet(env, `usuarios/${localId}`, {
-    nombre:{stringValue: inv.x.nombre || ''},
-    email:{stringValue: correo},
-    rol:{stringValue:'residente'},
-    casa:{stringValue: inv.x.domicilio || ''},
-  }, at);
-  await firestoreActualizarCampos(env, `vecinos/${inv.x.vecinoId}`, { uid:{stringValue:localId} }, 'Vecino');
+  // 3) Escribir correo+uid en la PERSONA (fuente de verdad) y sincronizar el índice
+  //    usuarios/{uid} (rol/casa/estado desde el doc de la persona, jamás del payload).
+  await firestoreActualizarCampos(env, `personas/${persona.id}`, { correo:{stringValue:correo}, uid:{stringValue:localId} }, 'Persona');
+  byId[persona.id] = { ...persona, correo, uid: localId };
+  await syncUsuarioIndex(env, at, byId[persona.id], byId);
 
   return json({ ok:true });
+}
+
+/* ===========================================================
+   PERSONAS (FASE 6.5) — padrón unificado. personas/{personaId} (id random estable) es
+   la FUENTE DE VERDAD; el Worker lee de ahí rol/estado/domicilio, nunca del payload.
+   usuarios/{uid} se mantiene como índice de auth (para reglas, getPerfil y /abrir) y lo
+   sincroniza el Worker. Jefe = residente sin jefeId (la CASA). Familiar = residente con
+   jefeId (HEREDA el domicilio del jefe, no se guarda copia). Admin/master = sin domicilio.
+   =========================================================== */
+
+async function personasList(env, at) {
+  at = at || await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const docs = await firestoreList(env, 'personas');
+  return docs.map(d => ({ id: d.name.split('/').pop(), ...readDoc(d.fields) }));
+}
+/* domicilio efectivo: el familiar HEREDA el del jefe (derivado, no copiado). */
+function domicilioDe(p, byId) {
+  if (p.jefeId) { const j = byId[p.jefeId]; return j ? (j.domicilio || '') : ''; }
+  return p.domicilio || '';
+}
+function esJefe(p) { return p.rol === 'residente' && !p.jefeId; }
+
+/* Proyecta la persona a usuarios/{uid} (solo si tiene cuenta) para reglas/getPerfil/abrir.
+   updateMask para NO borrar el fcmToken que escribe el cliente. */
+async function syncUsuarioIndex(env, at, persona, byId) {
+  if (!persona || !persona.uid) return;
+  const fields = {
+    nombre:{stringValue: persona.nombre || ''},
+    rol:{stringValue: persona.rol || 'residente'},
+    casa:{stringValue: domicilioDe(persona, byId)},
+    estado:{stringValue: persona.estado || 'activo'},
+    suspendido:{booleanValue: (persona.estado || 'activo') === 'suspendido'},
+    personaId:{stringValue: persona.id},
+    jefeId:{stringValue: persona.jefeId || ''},
+  };
+  if (persona.correo) fields.email = {stringValue: persona.correo};
+  await firestoreUpdate(env, `usuarios/${persona.uid}`, fields, Object.keys(fields));
+}
+/* Reindexar una persona y (si cambió su domicilio) todos sus familiares registrados. */
+async function resyncFamilia(env, at, personaId, incluirFamiliares) {
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  await syncUsuarioIndex(env, at, byId[personaId], byId);
+  if (incluirFamiliares) {
+    for (const f of all.filter(x => x.jefeId === personaId)) await syncUsuarioIndex(env, at, f, byId);
+  }
+}
+
+/* /personas/crear — SOLO staff. Alta de jefe (residente) o admin. El familiar NO se crea
+   aquí (lo invita su jefe). El correo NO se captura (lo pone la persona al registrarse). */
+async function crearPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff da de alta personas');
+
+  const { nombre, telefono, domicilio, rol } = await req.json();
+  const nom = String(nombre || '').trim().slice(0, 80);
+  const tel = String(telefono || '').trim().slice(0, 30);
+  if (!nom) throw httpErr(400, 'Falta el nombre');
+  if (!tel) throw httpErr(400, 'El teléfono es obligatorio');
+  if (!['admin', 'residente'].includes(rol)) throw httpErr(400, 'Rol inválido (admin o residente)');
+  if (rol === 'admin' && perfil.rol !== 'master') throw httpErr(403, 'Solo master crea administradores');
+
+  let dom = '', domNorm = '';
+  if (rol === 'residente') {
+    dom = String(domicilio || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!dom) throw httpErr(400, 'El domicilio es obligatorio para residentes');
+    domNorm = normDomicilio(dom);
+    // Anti-duplicados SOLO entre jefes de familia vivos.
+    const jefes = (await personasList(env)).filter(p => esJefe(p));
+    if (jefes.some(j => j.domicilioNorm === domNorm)) throw httpErr(409, `Ya existe una casa con el domicilio "${dom}"`);
+  }
+
+  const id = crypto.randomUUID();
+  await firestoreSet(env, `personas/${id}`, {
+    nombre:{stringValue:nom},
+    telefono:{stringValue:tel},
+    correo:{nullValue:null},
+    domicilio:{stringValue:dom},
+    domicilioNorm:{stringValue:domNorm},
+    rol:{stringValue:rol},
+    estado:{stringValue:'activo'},
+    uid:{nullValue:null},
+    jefeId:{nullValue:null},
+    suspendidoPor:{nullValue:null},
+    creadoPor:{stringValue:user.uid},
+    creadoEn:{timestampValue:new Date().toISOString()},
+  });
+  return json({ ok:true, id });
+}
+
+/* /personas/actualizar — SOLO staff. Edita nombre/teléfono/domicilio. El familiar no
+   tiene domicilio propio. Renombrar domicilio se BLOQUEA si la casa tiene pagos. */
+async function actualizarPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff edita personas');
+
+  const { id, nombre, telefono, domicilio } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+
+  const fields = {};
+  if (nombre !== undefined) { const nom = String(nombre).trim().slice(0,80); if (!nom) throw httpErr(400,'El nombre no puede quedar vacío'); fields.nombre = {stringValue:nom}; }
+  if (telefono !== undefined) { const tel = String(telefono).trim(); if (!tel) throw httpErr(400,'El teléfono es obligatorio'); fields.telefono = {stringValue:tel.slice(0,30)}; }
+  let cambioDomicilio = false;
+  if (domicilio !== undefined) {
+    if (p.jefeId) throw httpErr(400, 'Un familiar hereda el domicilio del jefe; no se edita aparte');
+    if (p.rol !== 'residente') throw httpErr(400, 'Solo los residentes (jefes) tienen domicilio');
+    const dom = String(domicilio).trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!dom) throw httpErr(400, 'Falta el domicilio');
+    const domNorm = normDomicilio(dom);
+    if (domNorm !== p.domicilioNorm) {
+      const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
+      if (finanzas.some(m => m.casa && normDomicilio(m.casa) === p.domicilioNorm)) {
+        throw httpErr(409, 'Esta casa tiene pagos registrados: no se puede renombrar el domicilio (rompería recibos y morosos). Solo se permite si no tiene pagos.');
+      }
+      if (all.some(x => esJefe(x) && x.id !== id && x.domicilioNorm === domNorm)) throw httpErr(409, `Ya existe otra casa con el domicilio "${dom}"`);
+      fields.domicilio = {stringValue:dom}; fields.domicilioNorm = {stringValue:domNorm};
+      cambioDomicilio = true;
+    }
+  }
+  if (!Object.keys(fields).length) throw httpErr(400, 'Nada que actualizar');
+
+  await firestoreActualizarCampos(env, `personas/${id}`, fields, 'Persona');
+  await resyncFamilia(env, at, id, cambioDomicilio);   // si cambió domicilio, resync familiares
+  return json({ ok:true, id });
+}
+
+/* /personas/suspender — SOLO staff. Suspender jefe hace CASCADA a sus familiares activos
+   (suspendidoPor='cascada'). Suspender familiar es individual. Todo en el Worker. */
+async function suspenderPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff suspende personas');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(x => byId[x.id] = x);
+  const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.rol === 'master') throw httpErr(403, 'No se puede suspender un master');
+
+  await firestoreActualizarCampos(env, `personas/${id}`, { estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'individual'} }, 'Persona');
+  if (esJefe(p)) {
+    for (const f of all.filter(x => x.jefeId === id && x.estado === 'activo')) {
+      await firestoreActualizarCampos(env, `personas/${f.id}`, { estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'cascada'} }, 'Persona');
+    }
+  }
+  await resyncFamilia(env, at, id, esJefe(p));
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} suspendió a ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}` });
+  return json({ ok:true, id });
+}
+
+/* /personas/reactivar — SOLO staff. Reactivar jefe reactiva SOLO los familiares con
+   suspendidoPor='cascada'. No se puede reactivar un familiar si su jefe sigue suspendido. */
+async function reactivarPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff reactiva personas');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(x => byId[x.id] = x);
+  const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.jefeId) {
+    const jefe = byId[p.jefeId];
+    if (jefe && jefe.estado === 'suspendido') throw httpErr(409, 'Reactiva primero al jefe de familia (la casa está suspendida).');
+  }
+
+  await firestoreActualizarCampos(env, `personas/${id}`, { estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null} }, 'Persona');
+  if (esJefe(p)) {
+    for (const f of all.filter(x => x.jefeId === id && x.estado === 'suspendido' && x.suspendidoPor === 'cascada')) {
+      await firestoreActualizarCampos(env, `personas/${f.id}`, { estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null} }, 'Persona');
+    }
+  }
+  await resyncFamilia(env, at, id, esJefe(p));
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} reactivó a ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}` });
+  return json({ ok:true, id });
+}
+
+/* /personas/borrar — SOLO master. Bloquea si el jefe tiene familiares o pagos. Respalda a
+   personas_borradas, borra la cuenta Auth + índice usuarios + invitaciones vivas, y registra. */
+async function borrarPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master borra personas');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(x => byId[x.id] = x);
+  const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.rol === 'master') throw httpErr(403, 'No se puede borrar un master');
+
+  if (esJefe(p)) {
+    const nFam = all.filter(x => x.jefeId === id).length;
+    if (nFam) throw httpErr(409, `Este jefe tiene ${nFam} familiar(es). Elimínalos primero.`);
+    const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
+    if (finanzas.some(m => m.casa && normDomicilio(m.casa) === p.domicilioNorm)) {
+      throw httpErr(409, 'Esta casa tiene pagos registrados: solo puedes suspenderla, no borrarla.');
+    }
+  }
+
+  const rGet = await fetch(`${fsBase(env)}/personas/${id}`, { headers:{ Authorization:'Bearer '+at } });
+  const doc = rGet.ok ? await rGet.json() : null;
+  await firestoreSet(env, `personas_borradas/${id}`, {
+    ...(doc?.fields || {}),
+    borradoPor:{stringValue:user.uid}, borradoNombre:{stringValue:perfil.nombre||''}, borradoTs:{timestampValue:new Date().toISOString()},
+  }, at);
+
+  if (p.uid) {
+    await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts:delete`, {
+      method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' }, body: JSON.stringify({ localId: p.uid }),
+    }).catch(() => {});
+    await fetch(`${fsBase(env)}/usuarios/${p.uid}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+  }
+  for (const iv of (await firestoreList(env, 'registro_invitaciones')).filter(d => { const x = readDoc(d.fields); return x.personaId === id && !x.usado; })) {
+    await fetch(`${fsBase(env)}/registro_invitaciones/${iv.name.split('/').pop()}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+  }
+  await fetch(`${fsBase(env)}/personas/${id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Master'} borró a ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}` });
+  return json({ ok:true, id });
+}
+
+/* /personas/listar — SOLO staff. Devuelve todo el padrón con domicilio resuelto (familiar
+   hereda el del jefe) + el conteo de CASAS ACTIVAS (jefes activos) para el termómetro. */
+async function listarPersonas(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff consulta el padrón');
+
+  const all = await personasList(env);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const personas = all.map(p => ({
+    id: p.id, nombre: p.nombre || '', telefono: p.telefono || '', correo: p.correo ?? null,
+    rol: p.rol || 'residente', estado: p.estado || 'activo', uid: p.uid ?? null,
+    jefeId: p.jefeId ?? null, suspendidoPor: p.suspendidoPor ?? null,
+    domicilio: domicilioDe(p, byId), domicilioNorm: p.domicilioNorm || '',
+    registrado: !!p.uid,
+  }));
+  const casasActivas = all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
+  return json({ personas, casasActivas });
+}
+
+/* /personas/mis-familiares — el JEFE lista SOLO a su propia familia (self-service:
+   badge N/5, invitar, cancelar). Nunca expone otras casas ni al resto del padrón.
+   Devuelve id/nombre/estado/registrado de cada familiar + el tope de 5. */
+async function misFamiliares(req, env) {
+  const user = await requireAuth(req, env);
+  const all = await personasList(env);
+  const jefe = all.find(p => p.uid === user.uid);
+  if (!jefe || !esJefe(jefe)) throw httpErr(403, 'Solo un jefe de familia tiene familiares');
+  const familiares = all.filter(p => p.jefeId === jefe.id)
+    .map(f => ({
+      id: f.id, nombre: f.nombre || '', telefono: f.telefono || '',
+      estado: f.estado || 'activo', registrado: !!f.uid, suspendidoPor: f.suspendidoPor ?? null,
+    }))
+    .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+  return json({
+    familiares, max: 5,
+    domicilio: jefe.domicilio || '',
+    puedeInvitar: (jefe.estado || 'activo') === 'activo',
+  });
 }
 
 /* ============ /finanzas/resumen — cualquier usuario autenticado ============
@@ -730,15 +1084,52 @@ async function resumenFinanzas(req, env) {
     if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa) pagaron.add(d.casa);
   }
 
-  // FASE 5: el total es el # de vecinos ACTIVOS del padrón (ya no config.totalCasas).
-  const vecinos = (await firestoreList(env, 'vecinos')).map(d => readDoc(d.fields));
-  const totalCasas = vecinos.filter(v => (v.estado || 'activo') === 'activo').length;
+  // FASE 6.5 (corregido): el total es el # de JEFES de familia (una casa = un jefe),
+  // ACTIVOS Y SUSPENDIDOS. Se revoca el criterio de FASE 5 de excluir suspendidos: si un
+  // suspendido no cuenta en el denominador, el % de cobranza mentiría.
+  const totalCasas = (await personasList(env)).filter(p => esJefe(p)).length;
 
   return json({
     ingreso, egreso, balance: ingreso - egreso,
     pagaron: pagaron.size,
     totalCasas,
   });
+}
+
+/* ============ /finanzas/cobranza — SOLO staff ============
+   Dos listas de casas (JEFES de familia, ACTIVAS y SUSPENDIDAS) para cobrar sin adivinar:
+   las que ya pagaron Cuota este mes y las que no. Cada casa lleva su domicilio, el nombre
+   del jefe y si está suspendida (para etiquetarla). TODO el conteo se hace aquí, no en el
+   cliente. Las suspendidas SÍ aparecen (suelen estarlo justo por mora). */
+async function cobranzaFinanzas(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff consulta la cobranza');
+
+  const now = new Date();
+  const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1);
+  const finMes = new Date(now.getFullYear(), now.getMonth()+1, 1);
+
+  // Domicilios que pagaron Cuota este mes (normalizados para casar con el padrón).
+  const pagadas = new Set();
+  for (const doc of await firestoreList(env, 'finanzas')) {
+    const d = readDoc(doc.fields);
+    const ts = new Date(d.ts);
+    if (!(ts >= inicioMes && ts < finMes)) continue;
+    if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa) pagadas.add(normDomicilio(d.casa));
+  }
+
+  // TODAS las casas (jefes), activas y suspendidas.
+  const casas = (await personasList(env)).filter(p => esJefe(p));
+  const pagaron = [], sinPago = [];
+  for (const c of casas) {
+    const item = { domicilio: c.domicilio || '', nombre: c.nombre || '', suspendido: (c.estado || 'activo') === 'suspendido' };
+    (pagadas.has(c.domicilioNorm) ? pagaron : sinPago).push(item);
+  }
+  const cmp = (a, b) => (a.domicilio || '').localeCompare(b.domicilio || '', 'es', { numeric: true });
+  pagaron.sort(cmp); sinPago.sort(cmp);
+
+  return json({ pagaron, sinPago, totalCasas: casas.length });
 }
 
 /* ============ /usuarios/crear — solo staff, vía Admin ============ */

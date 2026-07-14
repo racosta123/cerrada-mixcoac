@@ -27,8 +27,8 @@ let ME = null;          // { uid, nombre, rol, casa, residenteUid? }
 let unsubLog = null;
 let unsubInvites = null;
 let unsubFin = null;
-let vecinosCache = [];        // padrón (FASE 5): fuente de verdad de las casas en Finanzas
-let vecinosActivosCount = 0;  // conteo de activos calculado por el Worker (denominador del termómetro)
+let personasCache = [];       // padrón unificado (FASE 6.5): jefes (casas) + familiares + admins
+let miFamiliaCache = [];      // familiares del jefe en sesión (self-service en la pestaña Invitar)
 
 /* ====================== UTILIDADES ====================== */
 const $ = s => document.querySelector(s);
@@ -130,6 +130,7 @@ function enterApp(){
   watchLog();
   watchFinanzas();
   if (ME.rol==='residente' || ME.rol==='esclavo') watchInvites();
+  setupMiFamilia();
   registerPush();
 }
 
@@ -159,8 +160,12 @@ function buildTabs(){
     b.onclick = ()=> switchTab(t.id, b);
     bar.appendChild(b);
   });
-  if (isStaff){ loadUsers(); loadVecinos(); }
+  if (isStaff) loadPersonas();
 }
+
+/* Jefe de familia = residente sin jefeId (es la CASA). Los familiares (residente CON jefeId)
+   y los esclavos no invitan familia. Cuentas viejas sin jefeId cuentan como jefe. */
+function soyJefe(){ return ME.rol === 'residente' && !ME.jefeId; }
 
 function switchTab(id, btn){
   $$('.tabpane').forEach(p => p.classList.add('hidden'));
@@ -337,288 +342,374 @@ function watchInvites(){
     }, err => console.error(err));
 }
 
-/* ====================== ADMIN: usuarios ====================== */
-let newRole = 'residente';
-$('#newUserBtn')?.addEventListener('click', ()=> openSheet('#userOverlay'));
-$('#userOverlay')?.addEventListener('click', e => { if(e.target.id==='userOverlay') closeSheet('#userOverlay'); });
-$('#roleSeg')?.addEventListener('click', e => {
-  const b = e.target.closest('button'); if(!b) return;
-  $$('#roleSeg button').forEach(x=>x.classList.remove('sel'));
-  b.classList.add('sel'); newRole = b.dataset.r;
-  $('#casaField').style.display = newRole==='residente' ? 'block':'none';
-});
-$('#createUserBtn')?.addEventListener('click', createUser);
-
-async function createUser(){
-  const nombre = $('#nuName').value.trim();
-  const email  = $('#nuEmail').value.trim();
-  const pass   = $('#nuPass').value;
-  const casa   = $('#nuCasa').value.trim();
-  $('#nuErr').textContent = '';
-  if (!nombre || !email || pass.length < 8){ $('#nuErr').textContent = 'Datos incompletos (contraseña ≥ 8)'; return; }
-  if (newRole==='residente' && !casa){ $('#nuErr').textContent = 'Indica la casa / lote'; return; }
-  const btn = $('#createUserBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    // El alta de cuentas la hace el Worker con Admin SDK (no se expone el registro público).
-    await authedFetch('/usuarios/crear', { nombre, email, password:pass, rol:newRole, casa });
-    toast('Usuario creado', 'ok');
-    closeSheet('#userOverlay');
-    $('#nuName').value=$('#nuEmail').value=$('#nuPass').value=$('#nuCasa').value='';
-    loadUsers();
-  } catch(e){
-    $('#nuErr').textContent = e.message || 'No se pudo crear';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Crear usuario';
-  }
-}
-
-async function loadUsers(){
-  try {
-    const snap = await db.collection('usuarios').orderBy('rol').limit(200).get();
-    const list = $('#usersList'); list.innerHTML = '';
-    if (snap.empty){ list.innerHTML = '<div class="empty">Sin usuarios</div>'; return; }
-    const usuariosById = {};
-    snap.forEach(doc => {
-      if (doc.id === ME.uid) return;
-      const u = doc.data();
-      usuariosById[doc.id] = { nombre: u.nombre||'', email: u.email||'', casa: u.casa||'', rol: u.rol };
-      const row = document.createElement('div'); row.className = 'row';
-      // Solo residentes se pueden suspender por mora. master no puede suspender admin.
-      const puedeSuspender = u.rol==='residente' && !(ME.rol==='admin' && u.rol==='admin');
-      let right;
-      if (u.suspendido){
-        right = `<span class="tag susp">Suspendido</span><button class="row-act" data-react="${doc.id}">Reactivar</button>`;
-      } else if (puedeSuspender){
-        right = `<span class="tag">${roleLabel(u.rol)}</span><button class="row-act danger" data-susp="${doc.id}">Suspender</button>`;
-      } else {
-        right = `<span class="tag">${roleLabel(u.rol)}</span>`;
-      }
-      // Borrar cuenta: SOLO master y no sobre otra cuenta master (el Worker revalida).
-      if (ME.rol==='master' && u.rol!=='master'){
-        right += `<button class="row-act danger" data-del="${doc.id}">Borrar</button>`;
-      }
-      row.innerHTML = `
-        <div class="ri">${(u.nombre||'?')[0].toUpperCase()}</div>
-        <div class="rt"><div class="a">${esc(u.nombre)}</div><div class="b">${esc(u.email||'')} ${u.casa?'· '+esc(u.casa):''}</div></div>
-        <div style="display:flex;gap:8px;align-items:center">${right}</div>`;
-      list.appendChild(row);
-    });
-    list.querySelectorAll('[data-susp]').forEach(b=> b.onclick=()=> toggleSuspender(b.dataset.susp, true, b));
-    list.querySelectorAll('[data-react]').forEach(b=> b.onclick=()=> toggleSuspender(b.dataset.react, false, b));
-    list.querySelectorAll('[data-del]').forEach(b=> b.onclick=()=> abrirUsuarioDelSheet(b.dataset.del, usuariosById[b.dataset.del]));
-  } catch(e){ $('#usersList').innerHTML = '<div class="empty">Error cargando usuarios</div>'; }
-}
-
-async function toggleSuspender(uid, suspender, btn){
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    await authedFetch('/usuarios/suspender', { uid, suspendido: suspender });
-    toast(suspender ? 'Residente suspendido · no podrá abrir puertas' : 'Residente reactivado', suspender?'bad':'ok');
-    loadUsers();
-  } catch(e){
-    toast(e.message || 'No se pudo actualizar', 'bad');
-    btn.disabled = false; btn.textContent = suspender ? 'Suspender' : 'Reactivar';
-  }
-}
-
-/* Borrado de cuenta (solo master) — confirmación por MODAL, no confirm nativo. El Worker
-   borra Auth + doc /usuarios, respalda, y limpia el uid del vecino (reinvitable). */
-let usuarioDelId = null;
-function abrirUsuarioDelSheet(uid, info){
-  usuarioDelId = uid;
-  const i = info || {};
-  $('#usuarioDelInfo').innerHTML = `<b>${esc(i.nombre||'—')}</b> · ${esc(i.email||'')}${i.casa?' · '+esc(i.casa):''}`;
-  $('#usuarioDelErr').textContent = '';
-  openSheet('#usuarioDelOverlay');
-}
-$('#usuarioDelCancel')?.addEventListener('click', () => closeSheet('#usuarioDelOverlay'));
-$('#usuarioDelOverlay')?.addEventListener('click', e => { if(e.target.id==='usuarioDelOverlay') closeSheet('#usuarioDelOverlay'); });
-$('#usuarioDelConfirm')?.addEventListener('click', async () => {
-  if (!usuarioDelId || ME.rol !== 'master') return;
-  const btn = $('#usuarioDelConfirm'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    await authedFetch('/usuarios/borrar', { uid: usuarioDelId });
-    toast('Cuenta borrada', 'bad');
-    closeSheet('#usuarioDelOverlay');
-    loadUsers();
-    refrescarVecinos();   // el uid del vecino volvió a null → domicilio reinvitable
-  } catch(e){
-    $('#usuarioDelErr').textContent = e.message || 'No se pudo borrar';
-  } finally { btn.disabled = false; btn.textContent = 'Sí, borrar cuenta'; }
-});
-
-/* ====================== VECINOS (padrón · FASE 5) ======================
-   Padrón independiente de las cuentas de login. El domicilio es la fuente de verdad
-   de las casas en Finanzas. Se lee/escribe SOLO vía Worker (staff). Campos uid/miembros
-   quedan reservados para FASE 6; aquí no se usan. */
+/* ====================== PERSONAS (FASE 6.5) ======================
+   Padrón unificado leído del Worker (/personas/listar, solo staff). Jefe = residente sin
+   jefeId (= la CASA, fuente de verdad del domicilio en Finanzas). Familiar = residente con
+   jefeId (hereda el domicilio del jefe). Admin/master = sin domicilio. usuarios/{uid} es solo
+   un índice que sincroniza el Worker; aquí NO se lee/escribe esa colección directo. */
 const normDom = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
-function vecinosActivos(){ return vecinosCache.filter(v => v.estado === 'activo'); }
+function esJefeP(p){ return p.rol === 'residente' && !p.jefeId; }
+/* jefes() = TODAS las casas (activas y suspendidas). casasActivas() = solo activas, para el
+   dropdown de registro de ingreso (el Worker solo acepta cobrar a casas activas). El
+   termómetro y las listas de cobranza usan el conteo del Worker (todas las casas). */
+function casasActivas(){ return personasCache.filter(p => esJefeP(p) && p.estado === 'activo'); }
+function jefes(){ return personasCache.filter(esJefeP); }
 
-async function cargarVecinos(){
+async function cargarPersonas(){
   try {
-    const r = await authedFetch('/vecinos/listar', {});
-    vecinosCache = Array.isArray(r.vecinos) ? r.vecinos : [];
-    // El denominador del termómetro sale del Worker (no se cuenta en el frontend).
-    vecinosActivosCount = Number.isInteger(r.activos) ? r.activos : vecinosCache.filter(v=>v.estado==='activo').length;
-  } catch(e){ console.error('cargarVecinos', e); vecinosCache = []; vecinosActivosCount = 0; }
+    const r = await authedFetch('/personas/listar', {});
+    personasCache = Array.isArray(r.personas) ? r.personas : [];
+  } catch(e){ console.error('cargarPersonas', e); personasCache = []; }
 }
 /* recarga el padrón y refresca TODO lo que depende de él: la lista y, si Finanzas ya se
-   pintó, termómetro + morosos (que dependen de los vecinos activos). */
-async function refrescarVecinos(){
-  await cargarVecinos();
-  renderVecinos();
-  if (finMonths.length){
-    renderTermometro(pagaronDelMes(), vecinosActivosCount);
-    renderMorosos();
-  }
+   pintó, la cobranza (termómetro + listas pagaron/sin pago, conteo del Worker). */
+async function refrescarPersonas(){
+  await cargarPersonas();
+  renderPersonas();
+  if (finMonths.length) cargarCobranza();
 }
-async function loadVecinos(){ await refrescarVecinos(); }
+async function loadPersonas(){ await refrescarPersonas(); }
 
-function renderVecinos(){
-  const list = $('#vecinosList');
-  const raw = $('#vecinoSearch').value.trim();
+/* -------- lista agrupada por casa: jefe + sus familiares anidados; admins aparte -------- */
+function renderPersonas(){
+  const list = $('#personasList');
+  const raw = $('#personaSearch').value.trim();
   const q = normDom(raw);
-  let arr = vecinosCache.slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
-  if (q) arr = arr.filter(v =>
-    normDom(v.nombre).includes(q) || (v.domicilioNorm||'').includes(q) || (v.telefono||'').includes(raw));
-  if (!arr.length){ list.innerHTML = '<div class="empty">Sin vecinos</div>'; return; }
-  list.innerHTML = '';
-  arr.forEach(v => {
-    const susp = v.estado === 'suspendido';
-    const row = document.createElement('div'); row.className = 'row';
-    row.innerHTML = `
-      <div class="ri">${(v.nombre||'?')[0].toUpperCase()}</div>
-      <div class="rt"><div class="a">${esc(v.domicilio)}</div><div class="b">${esc(v.nombre)}${v.telefono?' · '+esc(v.telefono):''}</div></div>
-      <div style="display:flex;gap:8px;align-items:center">${susp?'<span class="tag susp">Suspendido</span>':'<span class="tag">Activo</span>'}</div>`;
-    const edit = document.createElement('button');
-    edit.className = 'row-act'; edit.textContent = 'Editar';
-    edit.addEventListener('click', () => abrirVecinoSheet(v));
-    row.appendChild(edit);
-    // Invitar (FASE 6): solo si el vecino está ACTIVO y aún no tiene cuenta vinculada.
-    if (v.estado === 'activo' && !v.uid){
-      const inv = document.createElement('button');
-      inv.className = 'row-act'; inv.textContent = '📲 Invitar';
-      inv.addEventListener('click', () => invitarVecino(v, inv));
-      row.appendChild(inv);
-    }
-    list.appendChild(row);
+  const match = p => !q || normDom(p.nombre).includes(q)
+    || (p.domicilioNorm||'').includes(q) || (p.telefono||'').includes(raw);
+
+  const familiaresDe = id => personasCache.filter(p => p.jefeId === id)
+    .sort((a,b)=>normDom(a.nombre).localeCompare(normDom(b.nombre),'es'));
+
+  const casas = jefes().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+  const admins = personasCache.filter(p => p.rol==='admin' || p.rol==='master')
+    .sort((a,b)=>normDom(a.nombre).localeCompare(normDom(b.nombre),'es'));
+
+  let html = '';
+  casas.forEach(j => {
+    const fam = familiaresDe(j.id);
+    const jefeMatch = match(j);
+    const famMatch = fam.filter(match);
+    if (q && !jefeMatch && !famMatch.length) return;   // esta casa no casa con la búsqueda
+    const visFam = q ? (jefeMatch ? fam : famMatch) : fam;   // si casa el jefe, muestra toda su familia
+    html += `<div class="casa-group">${personaRow(j)}`
+      + `<div class="fam-list">`
+      + (visFam.length ? visFam.map(personaRow).join('') : `<div class="fam-empty">Sin familiares aún (hasta 5)</div>`)
+      + `</div></div>`;
   });
-}
-$('#vecinoSearch')?.addEventListener('input', renderVecinos);
 
-let vecinoEditId = null;   // null = alta; id = edición
-function abrirVecinoSheet(v){
-  vecinoEditId = v ? v.id : null;
-  $('#vecinoTitle').textContent = v ? 'Editar vecino' : 'Alta de vecino';
-  $('#veName').value   = v?.nombre   || '';
-  $('#veCorreo').value = v?.correo   || '';
-  $('#veTel').value    = v?.telefono || '';
-  $('#veDom').value    = v?.domicilio|| '';
-  $('#veEstado').value = v?.estado   || 'activo';
-  $('#veEstadoField').classList.toggle('hidden', !v);   // estado solo en edición
-  // Borrar: SOLO master y solo en edición (el Worker revalida master + reglas de borrado).
-  $('#delVecinoBtn').classList.toggle('hidden', !(v && ME.rol === 'master'));
-  $('#veErr').textContent = '';
-  $('#saveVecinoBtn').textContent = v ? 'Guardar cambios' : 'Guardar vecino';
-  openSheet('#vecinoOverlay');
+  const visAdmins = admins.filter(match);
+  if (visAdmins.length){
+    html += `<div class="grp-admin"><div class="grp-label">Administración</div>`
+      + visAdmins.map(personaRow).join('') + `</div>`;
+  }
+  list.innerHTML = html || '<div class="empty">Sin personas en el padrón</div>';
 }
-$('#newVecinoBtn')?.addEventListener('click', () => abrirVecinoSheet(null));
-$('#vecinoOverlay')?.addEventListener('click', e => { if(e.target.id==='vecinoOverlay') closeSheet('#vecinoOverlay'); });
-$('#saveVecinoBtn')?.addEventListener('click', guardarVecino);
 
-async function guardarVecino(){
-  const nombre    = $('#veName').value.trim();
-  const correo    = $('#veCorreo').value.trim();
-  const telefono  = $('#veTel').value.trim();
-  const domicilio = $('#veDom').value.trim();
-  const estado    = $('#veEstado').value;
-  $('#veErr').textContent = '';
-  if (!nombre){ $('#veErr').textContent = 'Falta el nombre'; return; }
-  if (!telefono){ $('#veErr').textContent = 'El teléfono es obligatorio'; return; }
-  if (!domicilio){ $('#veErr').textContent = 'Falta el domicilio'; return; }
-  const btn = $('#saveVecinoBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+/* -------- una fila de persona: identidad + tags + botones de acción (según rol/estado) -------- */
+function personaRow(p){
+  const susp = p.estado === 'suspendido';
+  const esFam = !!p.jefeId;
+  const esAdmin = p.rol === 'admin';
+  const esMaster = p.rol === 'master';
+  const esYo = p.uid && p.uid === ME.uid;
+
+  const titulo = (esFam || esAdmin || esMaster) ? esc(p.nombre) : esc(p.domicilio || p.nombre);
+  const sub = (esFam || esAdmin || esMaster)
+    ? (p.telefono ? esc(p.telefono) : '')
+    : esc(p.nombre) + (p.telefono ? ' · '+esc(p.telefono) : '');
+
+  const tagEstado = susp
+    ? `<span class="tag susp">Suspendido${p.suspendidoPor==='cascada'?' (casa)':''}</span>`
+    : `<span class="tag in">Activo</span>`;
+  const tagCuenta = esMaster ? `<span class="tag">Master</span>`
+    : (p.registrado ? `<span class="tag in">Registrado</span>` : `<span class="tag">Sin cuenta</span>`);
+
+  // Acciones (delegadas por data-act). Al master no se le toca; tampoco a tu propia fila.
+  let acts = '';
+  if (!esMaster && !esYo){
+    acts += `<button class="row-act" data-act="editar" data-id="${p.id}">Editar</button>`;
+    // Invitar: solo jefe/admin ACTIVO y SIN cuenta (a los familiares los invita su jefe).
+    if (!esFam && !p.registrado && !susp)
+      acts += `<button class="row-act" data-act="invitar" data-id="${p.id}">📲 Invitar</button>`;
+    if (susp) acts += `<button class="row-act" data-act="reactivar" data-id="${p.id}">Reactivar</button>`;
+    else      acts += `<button class="row-act danger" data-act="suspender" data-id="${p.id}">Suspender</button>`;
+    if (ME.rol === 'master')
+      acts += `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
+  }
+
+  return `<div class="row">`
+      + `<div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
+      + `<div class="rt"><div class="a">${titulo}</div>${sub?`<div class="b">${sub}</div>`:''}</div>`
+      + `<div class="tags">${tagEstado}${tagCuenta}</div>`
+    + `</div>` + (acts ? `<div class="persona-acts">${acts}</div>` : '');
+}
+
+$('#personaSearch')?.addEventListener('input', renderPersonas);
+/* Delegación: cada botón de fila lleva data-act + data-id. */
+$('#personasList')?.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  const p = personasCache.find(x => x.id === b.dataset.id); if (!p) return;
+  switch (b.dataset.act){
+    case 'editar':    abrirPersonaSheet(p); break;
+    case 'invitar':   invitarPersona(p, b); break;
+    case 'suspender': cambiarEstadoPersona(p, 'suspender', b); break;
+    case 'reactivar': cambiarEstadoPersona(p, 'reactivar', b); break;
+    case 'borrar':    abrirPersonaDelSheet(p); break;
+  }
+});
+
+/* -------- alta / edición de persona (jefe o admin). El familiar se crea al invitarlo. -------- */
+let personaEditId = null;   // null = alta; id = edición
+let personaRolSel = 'residente';
+function setPersonaRol(r){
+  personaRolSel = r;
+  $$('#peRolSeg button').forEach(x=>x.classList.toggle('sel', x.dataset.r===r));
+  $('#peDomField').classList.toggle('hidden', r!=='residente');
+}
+$('#peRolSeg')?.addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b || b.classList.contains('hidden')) return;
+  setPersonaRol(b.dataset.r);
+});
+
+function abrirPersonaSheet(p){
+  personaEditId = p ? p.id : null;
+  const esFam = p && !!p.jefeId;
+  const esAdmin = p && p.rol === 'admin';
+  $('#personaTitle').textContent = p ? (esFam?'Editar familiar':'Editar persona') : 'Alta de persona';
+  $('#peName').value = p?.nombre || '';
+  $('#peTel').value  = p?.telefono || '';
+  $('#peDom').value  = (p && !esFam) ? (p.domicilio||'') : '';
+  // Rol: solo elegible en ALTA (el Worker no cambia rol al actualizar). "Administrador" solo master.
+  $('#peRolAdminBtn').classList.toggle('hidden', ME.rol !== 'master');
+  $('#peRolField').classList.toggle('hidden', !!p);
+  setPersonaRol(p ? (esAdmin?'admin':(esFam?'familiar':'residente')) : 'residente');
+  // En edición el domicilio se muestra solo para jefes (el familiar lo hereda; el admin no tiene).
+  if (p) $('#peDomField').classList.toggle('hidden', esFam || esAdmin);
+  $('#peHint').classList.toggle('hidden', !!p);
+  // Borrar: solo master, no sobre master ni sobre tu propia cuenta (el Worker revalida).
+  $('#delPersonaBtn').classList.toggle('hidden', !(p && ME.rol==='master' && p.rol!=='master' && p.uid!==ME.uid));
+  $('#peErr').textContent = '';
+  $('#savePersonaBtn').textContent = p ? 'Guardar cambios' : 'Guardar';
+  openSheet('#personaOverlay');
+}
+$('#newPersonaBtn')?.addEventListener('click', () => abrirPersonaSheet(null));
+$('#personaOverlay')?.addEventListener('click', e => { if(e.target.id==='personaOverlay') closeSheet('#personaOverlay'); });
+$('#savePersonaBtn')?.addEventListener('click', guardarPersona);
+
+async function guardarPersona(){
+  const nombre = $('#peName').value.trim();
+  const telefono = $('#peTel').value.trim();
+  const domicilio = $('#peDom').value.trim();
+  $('#peErr').textContent = '';
+  if (!nombre){ $('#peErr').textContent = 'Falta el nombre'; return; }
+  if (!telefono){ $('#peErr').textContent = 'El teléfono es obligatorio'; return; }
+  const esEdicion = !!personaEditId;
+  const editP = esEdicion ? personasCache.find(x=>x.id===personaEditId) : null;
+  const rol = esEdicion ? editP.rol : personaRolSel;
+  const jefeConDom = esEdicion ? esJefeP(editP) : (rol==='residente');
+  if (jefeConDom && !domicilio){ $('#peErr').textContent = 'El domicilio es obligatorio para una casa'; return; }
+  const btn = $('#savePersonaBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
     // El Worker valida rol staff y el anti-duplicados de domicilio server-side.
-    if (vecinoEditId){
-      await authedFetch('/vecinos/actualizar', { id: vecinoEditId, nombre, correo, telefono, domicilio, estado });
-      toast('Vecino actualizado', 'ok');
+    if (esEdicion){
+      const body = { id: personaEditId, nombre, telefono };
+      if (jefeConDom) body.domicilio = domicilio;   // solo el jefe edita domicilio
+      await authedFetch('/personas/actualizar', body);
+      toast('Persona actualizada', 'ok');
     } else {
-      await authedFetch('/vecinos/crear', { nombre, correo, telefono, domicilio });
-      toast('Vecino dado de alta', 'ok');
+      const body = { nombre, telefono, rol };
+      if (rol === 'residente') body.domicilio = domicilio;
+      await authedFetch('/personas/crear', body);
+      toast(rol==='admin' ? 'Administrador dado de alta' : 'Casa dada de alta', 'ok');
     }
-    closeSheet('#vecinoOverlay');
-    await refrescarVecinos();
+    closeSheet('#personaOverlay');
+    await refrescarPersonas();
   } catch(e){
-    $('#veErr').textContent = e.message || 'No se pudo guardar';
+    $('#peErr').textContent = e.message || 'No se pudo guardar';
   } finally {
-    btn.disabled = false; btn.textContent = vecinoEditId ? 'Guardar cambios' : 'Guardar vecino';
+    btn.disabled = false; btn.textContent = esEdicion ? 'Guardar cambios' : 'Guardar';
   }
 }
 
-/* Borrado de vecino (solo master) — confirmación por MODAL, no confirm nativo.
-   El Worker revalida master, bloquea si hay pagos y respalda a vecinos_borrados. */
-$('#delVecinoBtn')?.addEventListener('click', () => {
-  if (!vecinoEditId || ME.rol !== 'master') return;
-  const v = vecinosCache.find(x => x.id === vecinoEditId);
-  $('#vecinoDelInfo').innerHTML = `<b>${esc(v?.domicilio || '')}</b> · ${esc(v?.nombre || '')}`;
-  $('#vecinoDelErr').textContent = '';
-  openSheet('#vecinoDelOverlay');
-});
-$('#vecinoDelCancel')?.addEventListener('click', () => closeSheet('#vecinoDelOverlay'));
-$('#vecinoDelOverlay')?.addEventListener('click', e => { if(e.target.id==='vecinoDelOverlay') closeSheet('#vecinoDelOverlay'); });
-$('#vecinoDelConfirm')?.addEventListener('click', async () => {
-  if (!vecinoEditId || ME.rol !== 'master') return;
-  const btn = $('#vecinoDelConfirm'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    await authedFetch('/vecinos/borrar', { id: vecinoEditId });
-    toast('Vecino borrado', 'bad');
-    closeSheet('#vecinoDelOverlay');
-    closeSheet('#vecinoOverlay');
-    await refrescarVecinos();
-  } catch(e){
-    $('#vecinoDelErr').textContent = e.message || 'No se pudo borrar';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Sí, borrar';
-  }
-});
-
-/* Invitación por WhatsApp (FASE 6). El token lo genera el Worker; el link se arma desde
-   location.origin (sirve en local y prod). SIEMPRE Web Share; jamás wa.me ni pestañas
-   nuevas. Plan B: modal con "Copiar link" si navigator.share no existe. */
-async function invitarVecino(v, btn){
+/* -------- suspender / reactivar (staff). Suspender un jefe hace cascada a su familia. -------- */
+async function cambiarEstadoPersona(p, accion, btn){
   const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
-    const r = await authedFetch('/invitaciones/crear', { vecinoId: v.id });
+    await authedFetch('/personas/'+accion, { id: p.id });
+    const cascada = esJefeP(p) ? ' (y su familia)' : '';
+    toast(accion==='suspender' ? 'Suspendido'+cascada+' · no podrá abrir puertas' : 'Reactivado'+cascada,
+          accion==='suspender' ? 'bad' : 'ok');
+    await refrescarPersonas();
+  } catch(e){
+    toast(e.message || 'No se pudo actualizar', 'bad');
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+/* -------- borrado de persona (solo master) — confirmación por MODAL, no confirm nativo.
+   El Worker revalida master, bloquea jefe con familiares/pagos y respalda a personas_borradas. -------- */
+let personaDelId = null;
+function abrirPersonaDelSheet(p){
+  personaDelId = p.id;
+  $('#personaDelInfo').innerHTML = esJefeP(p)
+    ? `<b>${esc(p.domicilio||'')}</b> · ${esc(p.nombre||'')}`
+    : `<b>${esc(p.nombre||'')}</b>${p.domicilio?' · '+esc(p.domicilio):''}`;
+  $('#personaDelErr').textContent = '';
+  openSheet('#personaDelOverlay');
+}
+$('#personaDelCancel')?.addEventListener('click', () => closeSheet('#personaDelOverlay'));
+$('#personaDelOverlay')?.addEventListener('click', e => { if(e.target.id==='personaDelOverlay') closeSheet('#personaDelOverlay'); });
+$('#personaDelConfirm')?.addEventListener('click', async () => {
+  if (!personaDelId || ME.rol !== 'master') return;
+  const btn = $('#personaDelConfirm'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/borrar', { id: personaDelId });
+    toast('Persona borrada', 'bad');
+    closeSheet('#personaDelOverlay');
+    await refrescarPersonas();
+  } catch(e){
+    $('#personaDelErr').textContent = e.message || 'No se pudo borrar';
+  } finally { btn.disabled = false; btn.textContent = 'Sí, borrar'; }
+});
+
+/* -------- invitación de registro (staff → jefe/admin sin cuenta). El token lo genera el
+   Worker; el link se arma desde location.origin. SIEMPRE Web Share; jamás wa.me ni pestañas
+   nuevas. Plan B: modal "Copiar link" si navigator.share no existe. -------- */
+async function invitarPersona(p, btn){
+  const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/invitaciones/crear', { personaId: p.id });
     const url = new URL('registro.html', location.href).href + '#' + r.token;
-    const texto = `Hola, te invito a registrarte en la app de Cerrada Mixcoac para el domicilio ${v.domicilio}. Abre este enlace (vence en 72 h):`;
-    if (navigator.share){
-      try { await navigator.share({ title:'Cerrada Mixcoac', text: texto, url }); }
-      catch(e){ if (!(e && e.name === 'AbortError')) throw e; }   // AbortError = el usuario canceló
-    } else {
-      abrirInviteFallback(v, url);   // Plan B
-    }
+    const destino = esJefeP(p) ? `el domicilio ${p.domicilio}` : 'la administración';
+    const texto = `Hola, te invito a registrarte en la app de Cerrada Mixcoac para ${destino}. Abre este enlace (vence en 72 h):`;
+    await compartirInvitacion({ title:'Cerrada Mixcoac', text: texto, url },
+      { titulo: esJefeP(p) ? p.domicilio : p.nombre, sub: p.nombre });
   } catch(e){
     toast(e.message || 'No se pudo generar la invitación', 'bad');
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
+/* Web Share primero (AbortError = el usuario canceló, no es error). Plan B: modal copiar link. */
 let inviteFallbackUrl = null;
-function abrirInviteFallback(v, url){
+async function compartirInvitacion(shareData, info){
+  if (navigator.share){
+    try { await navigator.share(shareData); }
+    catch(e){ if (!(e && e.name === 'AbortError')) abrirInviteFallback(shareData.url, info); }
+  } else {
+    abrirInviteFallback(shareData.url, info);
+  }
+}
+function abrirInviteFallback(url, info){
   inviteFallbackUrl = url;
-  $('#inviteFallbackInfo').innerHTML = `<b>${esc(v.domicilio)}</b> · ${esc(v.nombre)}`;
+  $('#inviteFallbackInfo').innerHTML = `<b>${esc(info.titulo||'')}</b>${info.sub?' · '+esc(info.sub):''}`;
   $('#inviteFallbackLink').value = url;
   openSheet('#inviteFallbackOverlay');
 }
 $('#inviteFallbackClose')?.addEventListener('click', () => closeSheet('#inviteFallbackOverlay'));
 $('#inviteFallbackOverlay')?.addEventListener('click', e => { if(e.target.id==='inviteFallbackOverlay') closeSheet('#inviteFallbackOverlay'); });
 $('#inviteCopyBtn')?.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(inviteFallbackUrl); toast('Link copiado', 'ok'); }
+  catch(e){ $('#inviteFallbackLink').select(); document.execCommand('copy'); toast('Link copiado', 'ok'); }
+});
+
+/* ====================== MI FAMILIA (FASE 6.5 · self-service del jefe) ======================
+   El jefe de familia (residente sin jefeId) invita hasta 5 familiares. El tope y la
+   pertenencia los valida el Worker; aquí solo pintamos N/5 y permitimos cancelar a los que
+   sigan "Sin cuenta". Se lee de /personas/mis-familiares (jefe-only). */
+function setupMiFamilia(){
+  const sec = $('#miFamiliaSection');
+  if (!sec) return;
+  if (!soyJefe()){ sec.classList.add('hidden'); return; }
+  sec.classList.remove('hidden');
+  cargarMiFamilia();
+}
+async function cargarMiFamilia(){
   try {
-    await navigator.clipboard.writeText(inviteFallbackUrl);
-    toast('Link copiado', 'ok');
+    const r = await authedFetch('/personas/mis-familiares', {});
+    miFamiliaCache = Array.isArray(r.familiares) ? r.familiares : [];
+    renderMiFamilia(r.max || 5, r.puedeInvitar !== false);
   } catch(e){
-    $('#inviteFallbackLink').select(); document.execCommand('copy');
-    toast('Link copiado', 'ok');
+    // Cuenta previa a FASE 6.5 (sin persona vinculada) u otro error: oculta la sección.
+    console.error('cargarMiFamilia', e);
+    $('#miFamiliaSection').classList.add('hidden');
   }
+}
+function renderMiFamilia(max, puedeInvitar){
+  const n = miFamiliaCache.length;
+  $('#famCount').textContent = `(${n}/${max})`;
+  const btn = $('#newFamiliarBtn');
+  const lleno = n >= max;
+  btn.disabled = lleno || !puedeInvitar;
+  btn.textContent = lleno ? `Máximo ${max} familiares` : 'Invitar familiar';
+
+  const list = $('#familiaList');
+  if (!n){ list.innerHTML = '<div class="empty">Aún no has invitado a nadie</div>'; return; }
+  list.innerHTML = '';
+  miFamiliaCache.slice().sort((a,b)=>normDom(a.nombre).localeCompare(normDom(b.nombre),'es')).forEach(f => {
+    const susp = f.estado === 'suspendido';
+    const tagEstado = susp ? `<span class="tag susp">Suspendido</span>` : `<span class="tag in">Activo</span>`;
+    const tagCuenta = f.registrado ? `<span class="tag in">Registrado</span>` : `<span class="tag">Sin cuenta</span>`;
+    const row = document.createElement('div'); row.className = 'row';
+    row.innerHTML = `<div class="ri">${esc(((f.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
+      + `<div class="rt"><div class="a">${esc(f.nombre)}</div>${f.telefono?`<div class="b">${esc(f.telefono)}</div>`:''}</div>`
+      + `<div class="tags">${tagEstado}${tagCuenta}</div>`;
+    list.appendChild(row);
+    // Cancelar: solo mientras el familiar siga "Sin cuenta" (aún no se registró).
+    if (!f.registrado){
+      const wrap = document.createElement('div'); wrap.className = 'persona-acts';
+      const c = document.createElement('button');
+      c.className = 'row-act danger'; c.textContent = 'Cancelar';
+      c.addEventListener('click', () => abrirFamiliarCancel(f));
+      wrap.appendChild(c); list.appendChild(wrap);
+    }
+  });
+}
+$('#newFamiliarBtn')?.addEventListener('click', () => {
+  $('#faName').value = ''; $('#faTel').value = ''; $('#faErr').textContent = '';
+  openSheet('#familiarOverlay');
+});
+$('#familiarOverlay')?.addEventListener('click', e => { if(e.target.id==='familiarOverlay') closeSheet('#familiarOverlay'); });
+$('#saveFamiliarBtn')?.addEventListener('click', async () => {
+  const nombre = $('#faName').value.trim();
+  const telefono = $('#faTel').value.trim();
+  $('#faErr').textContent = '';
+  if (!nombre){ $('#faErr').textContent = 'Falta el nombre del familiar'; return; }
+  if (!telefono){ $('#faErr').textContent = 'El teléfono es obligatorio'; return; }
+  const btn = $('#saveFamiliarBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    // El Worker crea la persona familiar + token y valida el tope de 5 server-side.
+    const r = await authedFetch('/invitaciones/familiar', { nombre, telefono });
+    closeSheet('#familiarOverlay');
+    await cargarMiFamilia();
+    const url = new URL('registro.html', location.href).href + '#' + r.token;
+    const texto = `Hola ${nombre}, te invito a registrarte en la app de Cerrada Mixcoac como parte de mi familia. Abre este enlace (vence en 72 h):`;
+    await compartirInvitacion({ title:'Cerrada Mixcoac', text: texto, url }, { titulo: nombre, sub:'Familiar' });
+  } catch(e){
+    $('#faErr').textContent = e.message || 'No se pudo generar la invitación';
+  } finally { btn.disabled = false; btn.textContent = 'Generar invitación'; }
+});
+
+let familiarCancelId = null;
+function abrirFamiliarCancel(f){
+  familiarCancelId = f.id;
+  $('#familiarCancelInfo').innerHTML = `<b>${esc(f.nombre||'')}</b>${f.telefono?' · '+esc(f.telefono):''}`;
+  $('#familiarCancelErr').textContent = '';
+  openSheet('#familiarCancelOverlay');
+}
+$('#familiarCancelClose')?.addEventListener('click', () => closeSheet('#familiarCancelOverlay'));
+$('#familiarCancelOverlay')?.addEventListener('click', e => { if(e.target.id==='familiarCancelOverlay') closeSheet('#familiarCancelOverlay'); });
+$('#familiarCancelConfirm')?.addEventListener('click', async () => {
+  if (!familiarCancelId) return;
+  const btn = $('#familiarCancelConfirm'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/familiar-cancelar', { id: familiarCancelId });
+    toast('Familiar cancelado', 'bad');
+    closeSheet('#familiarCancelOverlay');
+    await cargarMiFamilia();
+  } catch(e){
+    $('#familiarCancelErr').textContent = e.message || 'No se pudo cancelar';
+  } finally { btn.disabled = false; btn.textContent = 'Sí, cancelar'; }
 });
 
 /* ====================== FINANZAS ====================== */
@@ -701,12 +792,10 @@ function watchFinanzas(){
   $('#finMonth').textContent = 'Finanzas · ' + label;
 
   if (isStaff){
-    // FASE 5: el padrón alimenta termómetro/morosos/dropdown; se recarga al entrar
-    // (y tras cada alta/edición vía refrescarVecinos). No hay lectura directa de vecinos.
-    cargarVecinos().then(() => {
-      renderTermometro(pagaronDelMes(), vecinosActivosCount);
-      renderMorosos();
-    });
+    // FASE 6.5: el padrón alimenta los dropdowns; la cobranza (termómetro + listas pagaron/
+    // sin pago) la calcula el Worker. Carga el padrón primero (para el dropdown de detalle)
+    // y luego la cobranza.
+    cargarPersonas().then(() => cargarCobranza());
     unsubFin = db.collection('finanzas')
       .where('ts','>=',finMonths[0].start)
       .orderBy('ts','desc').limit(1200)
@@ -742,7 +831,7 @@ function renderTermometro(pagaron, totalCasas){
     fill.className = 'therm-fill';
     const isStaff = (ME.rol==='master' || ME.rol==='admin');
     $('#thermText').textContent = isStaff
-      ? 'Da de alta vecinos en Gestión para activar el termómetro.'
+      ? 'Da de alta casas en Gestión para activar el termómetro.'
       : 'El termómetro aún no está disponible.';
     return;
   }
@@ -753,10 +842,9 @@ function renderTermometro(pagaron, totalCasas){
   $('#thermText').textContent = `${pagaron} de ${totalCasas} casas pagaron (${pct}%)`;
 }
 
-/* -------- fuente ÚNICA: Map(domicilioNorm → pago) de casas que pagaron Cuota este mes.
-   Compartida por termómetro, morosos y "consultar casa" — no vuelven a divergir. El
-   domicilio guardado en finanzas ya es el canónico del padrón; se normaliza igual que en
-   el Worker (MAYÚSCULAS) para casar con vecinosCache. -------- */
+/* -------- Map(domicilioNorm → pago) de casas que pagaron Cuota este mes, desde finCache.
+   Solo lo usa "Consultar casa (detalle)" para mostrar folio/monto/fecha del pago; el conteo
+   de la cobranza (termómetro + listas) lo hace el Worker, no esto. -------- */
 function pagosPorCasaDelMes(){
   const curKey = monthKey(new Date());
   const map = new Map();
@@ -768,60 +856,69 @@ function pagosPorCasaDelMes(){
   });
   return map;
 }
-function pagaronDelMes(){ return pagosPorCasaDelMes().size; }
 
-/* -------- lista de morosos del mes (solo staff) — colapsable, cerrada por default.
-   Universo = vecinos ACTIVOS del padrón (suspendidos no se cobran ni son morosos). -------- */
-let morososExpandido = false;
-function renderMorosos(){
-  const list = $('#morososList');
-  const countEl = $('#morososCount');
-  const toggle = $('#morososToggle');
+/* -------- cobranza del mes (solo staff): DOS listas colapsables (pagaron / sin pago),
+   sin seleccionar nada. Universo = TODAS las casas (jefes activos Y suspendidos); las
+   suspendidas llevan etiqueta. El conteo lo hace el Worker (/finanzas/cobranza), no el
+   frontend, para que termómetro y listas nunca diverjan. -------- */
+let cobranzaCache = { pagaron: [], sinPago: [], totalCasas: 0 };
+let pagaronExpandido = false, sinPagoExpandido = false;
 
-  poblarConsultaCasa();
-
-  const activos = vecinosActivos();
-  if (!activos.length){
-    countEl.textContent = 'Sin vecinos activos';
-    list.innerHTML = '<div class="empty">Da de alta vecinos en Gestión para ver morosos</div>';
-    list.classList.toggle('hidden', !morososExpandido);
-    toggle.classList.toggle('abierto', morososExpandido);
-    return;
-  }
-
-  const pagados = pagosPorCasaDelMes();
-  const morosos = activos.filter(v => !pagados.has(v.domicilioNorm));
-  const activosNorm = new Set(activos.map(v => v.domicilioNorm));
-  const noReconocidos = [...pagados.entries()].filter(([k]) => !activosNorm.has(k));
-
-  countEl.textContent = `${morosos.length} casa${morosos.length===1?'':'s'} sin pago`;
-
-  let html = morosos.length
-    ? morosos.map(v => `<div class="row"><div class="rt"><div class="a">${esc(v.domicilio)}</div></div><span class="tag out">Sin pago</span></div>`).join('')
-    : '<div class="empty">Todas las casas están al corriente</div>';
-  if (noReconocidos.length){
-    html += `<div class="section-title" style="margin-top:14px;font-size:12px">No reconocidos (fuera del padrón activo)</div>` +
-      noReconocidos.map(([,m]) => `<div class="row"><div class="rt"><div class="a">${esc(m.casa)}</div></div><span class="tag">Revisar</span></div>`).join('');
-  }
-  list.innerHTML = html;
-  list.classList.toggle('hidden', !morososExpandido);
-  toggle.classList.toggle('abierto', morososExpandido);
+async function cargarCobranza(){
+  try {
+    const r = await authedFetch('/finanzas/cobranza', {});
+    cobranzaCache = { pagaron: r.pagaron || [], sinPago: r.sinPago || [], totalCasas: r.totalCasas || 0 };
+  } catch(e){ console.error('cargarCobranza', e); cobranzaCache = { pagaron: [], sinPago: [], totalCasas: 0 }; }
+  renderCobranza();
 }
-$('#morososToggle').addEventListener('click', () => {
-  morososExpandido = !morososExpandido;
-  $('#morososList').classList.toggle('hidden', !morososExpandido);
-  $('#morososToggle').classList.toggle('abierto', morososExpandido);
+/* una fila de casa: domicilio + nombre del jefe (+ etiqueta Suspendido si aplica) */
+function casaRowCobranza(c){
+  const tag = c.suspendido ? '<span class="tag susp">Suspendido</span>' : '';
+  return `<div class="row"><div class="rt"><div class="a">${esc(c.domicilio)}</div>`
+    + `${c.nombre?`<div class="b">${esc(c.nombre)}</div>`:''}</div>${tag}</div>`;
+}
+function renderCobranza(){
+  poblarConsultaCasa();
+  const { pagaron, sinPago, totalCasas } = cobranzaCache;
+  // Termómetro (staff) con el conteo del Worker: denominador = TODAS las casas.
+  renderTermometro(pagaron.length, totalCasas);
+
+  $('#pagaronCount').textContent = `✅ Pagaron (${pagaron.length})`;
+  $('#sinPagoCount').textContent = `❌ Sin pago (${sinPago.length})`;
+  $('#pagaronList').innerHTML = pagaron.length
+    ? pagaron.map(casaRowCobranza).join('')
+    : '<div class="empty">Nadie ha pagado aún este mes</div>';
+  $('#sinPagoList').innerHTML = sinPago.length
+    ? sinPago.map(casaRowCobranza).join('')
+    : (totalCasas ? '<div class="empty">Todas las casas están al corriente</div>'
+                  : '<div class="empty">Da de alta casas en Gestión</div>');
+  $('#pagaronList').classList.toggle('hidden', !pagaronExpandido);
+  $('#pagaronToggle').classList.toggle('abierto', pagaronExpandido);
+  $('#sinPagoList').classList.toggle('hidden', !sinPagoExpandido);
+  $('#sinPagoToggle').classList.toggle('abierto', sinPagoExpandido);
+}
+$('#pagaronToggle')?.addEventListener('click', () => {
+  pagaronExpandido = !pagaronExpandido;
+  $('#pagaronList').classList.toggle('hidden', !pagaronExpandido);
+  $('#pagaronToggle').classList.toggle('abierto', pagaronExpandido);
+});
+$('#sinPagoToggle')?.addEventListener('click', () => {
+  sinPagoExpandido = !sinPagoExpandido;
+  $('#sinPagoList').classList.toggle('hidden', !sinPagoExpandido);
+  $('#sinPagoToggle').classList.toggle('abierto', sinPagoExpandido);
 });
 
-/* -------- consultar el estado de un domicilio del padrón (solo staff) -------- */
+/* -------- consultar el detalle de un domicilio (solo staff). Lista TODAS las casas
+   (activas y suspendidas); las suspendidas se marcan en la opción. -------- */
 function poblarConsultaCasa(){
   const sel = $('#consultaCasaSel');
-  const activos = vecinosActivos().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+  const casas = jefes().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
   sel.innerHTML = '';
-  if (!activos.length){ sel.appendChild(new Option('—','')); renderConsultaCasa(); return; }
+  if (!casas.length){ sel.appendChild(new Option('—','')); renderConsultaCasa(); return; }
   sel.appendChild(new Option('Elige un domicilio…',''));
-  activos.forEach(v => sel.appendChild(new Option(v.domicilio, v.domicilio)));   // new Option escapa seguro
+  casas.forEach(v => sel.appendChild(new Option(   // new Option escapa seguro
+    v.estado === 'suspendido' ? v.domicilio + ' (suspendido)' : v.domicilio, v.domicilio)));
   if (prev) sel.value = prev;
   renderConsultaCasa();
 }
@@ -883,8 +980,8 @@ function renderFinanzas(){
   renderFinCharts(byMonth, curKey);
   populateFiltros();
   filterAndRenderMovs();
-  renderTermometro(pagaronDelMes(), vecinosActivosCount);
-  renderMorosos();
+  // Un movimiento nuevo puede cambiar quién pagó → recalcula la cobranza en el Worker.
+  cargarCobranza();
 }
 
 /* -------- gastos por categoría del mes (compartido: dashboard + PDF) -------- */
@@ -1226,15 +1323,15 @@ async function borrarMovimiento(m, btn){
 /* registrar movimiento (solo staff) */
 /* FASE 4.5: casa obligatoria en TODO ingreso — cada recibo queda amarrado a una casa. */
 function casaRequerida(){ return movType==='ingreso'; }
-/* FASE 5: el campo Domicilio es un dropdown con los domicilios de vecinos ACTIVOS del
-   padrón (ya no números 1..N ni texto libre) — el Worker revalida contra el padrón. */
+/* FASE 6.5: el campo Domicilio es un dropdown con las casas ACTIVAS del padrón (jefes
+   activos; ya no números 1..N ni texto libre) — el Worker revalida contra el padrón. */
 function poblarCasaSelect(){
   const sel = $('#movCasa');
-  const activos = vecinosActivos().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+  const activos = casasActivas().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
   sel.innerHTML = '';
   if (!activos.length){
-    sel.appendChild(new Option('Da de alta vecinos primero',''));
+    sel.appendChild(new Option('Da de alta casas primero',''));
     sel.disabled = true; return;
   }
   sel.disabled = false;
@@ -1648,14 +1745,14 @@ $('#reciboDlBtn').addEventListener('click', async () => {
   } finally { btn.disabled = false; btn.textContent = original; }
 });
 
-/* ====================== FASE 4.5 · REPORTE POR CASA (FASE 5: desde el padrón) ====================== */
+/* ====================== FASE 4.5 · REPORTE POR CASA (FASE 6.5: desde el padrón) ====================== */
 $('#casaRepBtn').addEventListener('click', () => {
-  const casas = vecinosCache.slice()
+  const casas = jefes().slice()   // todas las casas (activas y suspendidas) para poder reportar cualquiera
     .sort((a,b) => a.domicilio.localeCompare(b.domicilio, 'es', { numeric:true }))
     .map(v => v.domicilio);
   const sel = $('#casaRepSel');
   sel.innerHTML = '';
-  if (!casas.length){ sel.appendChild(new Option('Sin vecinos en el padrón','')); }
+  if (!casas.length){ sel.appendChild(new Option('Sin casas en el padrón','')); }
   else { sel.appendChild(new Option('Elige un domicilio…','')); casas.forEach(c => sel.appendChild(new Option(c, c))); }
   $('#casaRepCustomField').classList.add('hidden');   // ya no hay texto libre: el padrón es la fuente
   $('#casaRepErr').textContent = '';

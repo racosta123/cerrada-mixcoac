@@ -25,7 +25,7 @@ const STAFF = new Set(['master','admin']);
 
 // SOLO DESARROLLO: permite probar el Worker desde el servidor local de pruebas.
 // Quitar esta línea cuando ya no se necesite probar desde localhost.
-const DEV_ORIGINS = ['http://localhost:4173'];
+const DEV_ORIGINS = [];
 
 export default {
   async fetch(req, env) {

@@ -1,4 +1,4 @@
-const CACHE = 'mixcoac-v19';
+const CACHE = 'mixcoac-v20';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(()=>self.skipWaiting()));

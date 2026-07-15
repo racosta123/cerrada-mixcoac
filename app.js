@@ -161,64 +161,7 @@ function buildTabs(){
     bar.appendChild(b);
   });
   if (isStaff) loadPersonas();
-  if (ME.rol === 'master') $('#pagosPruebaSection')?.classList.remove('hidden');  // TEMPORAL: quitar tras limpiar
 }
-
-/* TEMPORAL FASE 6.5 — pagos de prueba de las 2 casas bloqueadas + re-borrado de esas casas.
-   ① lista (no borra). ② borra pagos (/finanzas/borrar, respaldo a finanzas_borrados) y luego
-   las casas (/personas/borrar). Solo master; el Worker revalida. QUITAR handler + UI tras usar.
-   Los domicilios se resuelven en vivo desde el padrón (match por teléfono), no se hardcodean. */
-const PAGOS_PRUEBA_TELS = ['5533334444', '6623548567'];   // Casa 5 / María López · California #77 / Pedro Herrera
-async function casasPruebaResolver(){
-  const r = await authedFetch('/personas/listar', {});
-  const casas = (r.personas || []).filter(p => !p.jefeId && PAGOS_PRUEBA_TELS.includes(String(p.telefono || '').replace(/\D/g, '')));
-  return { casas, domsNorm: new Set(casas.map(c => normDom(c.domicilio))) };
-}
-async function pagosDePrueba(domsNorm){
-  const snap = await db.collection('finanzas').get();
-  const pagos = [];
-  snap.forEach(d => { const m = d.data(); if (m.casa && domsNorm.has(normDom(m.casa))) pagos.push({ id: d.id, ...m }); });
-  return pagos;
-}
-$('#listarPagosPruebaBtn')?.addEventListener('click', async () => {
-  const btn = $('#listarPagosPruebaBtn'), out = $('#pagosPruebaMsg');
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    const { domsNorm } = await casasPruebaResolver();
-    const pagos = await pagosDePrueba(domsNorm);
-    pagos.sort((a, b) => (a.casa || '').localeCompare(b.casa || '', 'es', { numeric: true }));
-    const lines = [`Pagos en Casa 5 + California #77: ${pagos.length}`, ''];
-    pagos.forEach(m => lines.push(`• ${m.casa} · ${m.folioRecibo || 'sin folio'} · ${money(m.monto)} · ${m.categoria || '—'} · ${m.tipo} · ${fmtTime(m.ts)}`));
-    out.textContent = lines.join('\n');
-    toast('Pagos listados', 'ok');
-  } catch (e) { out.textContent = 'ERROR: ' + (e.message || e); toast('Error al listar', 'bad'); }
-  finally { btn.disabled = false; btn.innerHTML = '🔎 Listar pagos de prueba (Casa 5 + California #77)'; }
-});
-$('#borrarPagosCasasBtn')?.addEventListener('click', async () => {
-  const btn = $('#borrarPagosCasasBtn'), out = $('#pagosPruebaMsg');
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  const log = []; const pinta = () => out.textContent = log.join('\n');
-  try {
-    const { casas, domsNorm } = await casasPruebaResolver();
-    const pagos = await pagosDePrueba(domsNorm);
-    log.push(`Borrando ${pagos.length} pago(s)…`); pinta();
-    for (const m of pagos) {
-      try { await authedFetch('/finanzas/borrar', { id: m.id }); log.push(`✅ pago ${m.folioRecibo || m.id} (${money(m.monto)}) — borrado`); }
-      catch (e) { log.push(`⚠️ pago ${m.folioRecibo || m.id} — ${e.message || 'error'}`); }
-      pinta();
-    }
-    log.push('', `Borrando ${casas.length} casa(s)…`); pinta();
-    for (const c of casas) {
-      try { await authedFetch('/personas/borrar', { id: c.id }); log.push(`✅ ${c.domicilio} / ${c.nombre} — casa borrada`); }
-      catch (e) { log.push(`⚠️ ${c.domicilio} / ${c.nombre} — ${e.message || 'error'}`); }
-      pinta();
-    }
-    log.push('', 'Listo.'); pinta();
-    btn.textContent = 'Ejecutado ✓';
-    toast('Pagos y casas procesados', 'ok');
-    if (typeof refrescarPersonas === 'function') refrescarPersonas();
-  } catch (e) { log.push('ERROR general: ' + (e.message || e)); pinta(); btn.disabled = false; btn.innerHTML = '🗑 Borrar pagos + casas'; toast('Error', 'bad'); }
-});
 
 /* Jefe de familia = residente sin jefeId (es la CASA). Los familiares (residente CON jefeId)
    y los esclavos no invitan familia. Cuentas viejas sin jefeId cuentan como jefe. */

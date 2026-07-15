@@ -161,7 +161,47 @@ function buildTabs(){
     bar.appendChild(b);
   });
   if (isStaff) loadPersonas();
+  if (ME.rol === 'master') $('#limpiarPruebasSection')?.classList.remove('hidden');  // TEMPORAL: quitar tras limpiar
 }
+
+/* TEMPORAL FASE 6.5 — limpieza one-click de personas de prueba. Resuelve ids en vivo
+   (match por teléfono con la lista fija de 6), borra FAMILIARES primero y JEFES después
+   (el Worker /personas/borrar revalida master, respalda, y limpia Auth de los registrados).
+   Solo toca los 6 objetivos; nada más. QUITAR este handler y su UI tras usar. */
+$('#limpiarPruebasBtn')?.addEventListener('click', async () => {
+  const btn = $('#limpiarPruebasBtn'), out = $('#limpiarPruebasMsg');
+  const dig = s => String(s || '').replace(/\D/g, '');
+  const OBJETIVOS = {
+    '5500000004': 'Familiar 4', '5500000005': 'Familiar 5', '5577778888': 'Hijo Uno',
+    '5500000009': 'Reemplazo', '5533334444': 'Casa 5 / María López', '6623548567': 'California #77 / Pedro Herrera',
+  };
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  const log = [];
+  const pinta = () => { out.textContent = log.join('\n'); };
+  try {
+    const r = await authedFetch('/personas/listar', {});
+    const match = (r.personas || []).filter(p => OBJETIVOS[dig(p.telefono)]);
+    match.sort((a, b) => (a.jefeId ? 0 : 1) - (b.jefeId ? 0 : 1));   // familiares (jefeId) primero
+    log.push(`Encontrados ${match.length} de 6. Borrando (familiares → jefes)…`); pinta();
+    for (const p of match) {
+      const et = OBJETIVOS[dig(p.telefono)] + (p.jefeId ? ' (familiar)' : ' (jefe)');
+      try {
+        await authedFetch('/personas/borrar', { id: p.id });
+        log.push(`✅ ${et} — borrado${p.registrado ? ' (+Auth)' : ''}`);
+      } catch (e) { log.push(`⚠️ ${et} — ${e.message || 'error'}`); }
+      pinta();
+    }
+    const hallados = new Set(match.map(p => dig(p.telefono)));
+    Object.entries(OBJETIVOS).forEach(([tel, nom]) => { if (!hallados.has(tel)) log.push(`· ${nom} — no encontrado (¿ya borrado?)`); });
+    log.push('Listo.'); pinta();
+    btn.textContent = 'Limpieza ejecutada ✓';
+    toast('Limpieza de pruebas ejecutada', 'ok');
+  } catch (e) {
+    log.push('ERROR general: ' + (e.message || e)); pinta();
+    btn.disabled = false; btn.textContent = 'Reintentar limpieza';
+    toast('Error en la limpieza', 'bad');
+  }
+});
 
 /* Jefe de familia = residente sin jefeId (es la CASA). Los familiares (residente CON jefeId)
    y los esclavos no invitan familia. Cuentas viejas sin jefeId cuentan como jefe. */

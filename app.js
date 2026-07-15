@@ -161,26 +161,7 @@ function buildTabs(){
     bar.appendChild(b);
   });
   if (isStaff) loadPersonas();
-  if (ME.rol === 'master') $('#limpiezaPruebaSection')?.classList.remove('hidden');  // TEMPORAL: quitar tras limpiar
 }
-
-/* TEMPORAL FASE 6.5 — borrado one-click de la cuenta de prueba de FASE 6
-   (residente.prueba.fase6@example.com, uid fijo legacy en usuarios/vecinos). Solo master;
-   el Worker revalida. QUITAR este handler y su UI tras confirmar el borrado. */
-$('#borrarPruebaBtn')?.addEventListener('click', async () => {
-  const btn = $('#borrarPruebaBtn'), msg = $('#borrarPruebaMsg');
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    const r = await authedFetch('/usuarios/borrar', { uid: 'dI9pIq5WqkRix1FBHtdRTiWa5P02' });
-    msg.textContent = 'OK · ' + JSON.stringify(r);
-    btn.textContent = 'Cuenta de prueba borrada ✓';
-    toast('Cuenta de prueba borrada', 'ok');
-  } catch(e){
-    msg.textContent = 'Error · ' + (e.message || 'no se pudo borrar');
-    btn.disabled = false; btn.textContent = 'Reintentar borrado';
-    toast('No se pudo borrar', 'bad');
-  }
-});
 
 /* Jefe de familia = residente sin jefeId (es la CASA). Los familiares (residente CON jefeId)
    y los esclavos no invitan familia. Cuentas viejas sin jefeId cuentan como jefe. */

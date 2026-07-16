@@ -1,6 +1,7 @@
-const CACHE = 'mixcoac-v23';
+const CACHE = 'mixcoac-v24';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
-  './assets/mixcoac-mobile.webp','./assets/mixcoac-desktop.webp'];
+  './assets/mixcoac-mobile.webp','./assets/mixcoac-desktop.webp',
+  './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(()=>self.skipWaiting()));
 });

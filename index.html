@@ -7,6 +7,9 @@
 <title>Cerrada Mixcoac</title>
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
+<!-- Fondo (letrero Mixcoac): precarga solo la variante del viewport para no retrasar el render -->
+<link rel="preload" as="image" href="assets/mixcoac-mobile.webp" media="(max-width:699px)">
+<link rel="preload" as="image" href="assets/mixcoac-desktop.webp" media="(min-width:700px)">
 <style>
   :root{
     --bg:#0d0d0f; --surface:#18181b; --surface-2:#1f1f23; --line:#2a2a30;
@@ -30,25 +33,38 @@
   button{font-family:inherit;cursor:pointer;border:none}
   input,select{font-family:inherit}
 
+  /* ---------- FONDO GLOBAL (letrero Mixcoac) ---------- */
+  #bgLayer{
+    position:fixed;inset:0;z-index:-2;
+    background-image:url('assets/mixcoac-mobile.webp');
+    background-size:cover;background-position:center;background-repeat:no-repeat;
+    background-color:var(--bg);   /* fallback mientras carga / si falla */
+  }
+  @media (min-width:700px){ #bgLayer{ background-image:url('assets/mixcoac-desktop.webp'); } }
+  /* Capa oscura sobre el fondo. LOGIN: suave (degradado, más oscuro abajo para el card).
+     INTERNAS (body.in-app): ~85% para que el fondo no compita con el contenido. */
+  #bgOverlay{
+    position:fixed;inset:0;z-index:-1;
+    /* LOGIN: capa más clara para lucir el letrero; se oscurece hacia abajo bajo el card */
+    background:linear-gradient(180deg, rgba(13,13,15,.16) 0%, rgba(13,13,15,.28) 46%, rgba(13,13,15,.70) 100%);
+    transition:background .35s ease;
+  }
+  body.in-app #bgOverlay{ background:rgba(13,13,15,.70); }
+
   /* ---------- LOGIN ---------- */
   .login-wrap{
     min-height:100dvh;display:flex;flex-direction:column;
-    align-items:center;justify-content:center;padding:28px;
+    align-items:center;justify-content:flex-end;
+    padding:28px 28px calc(34px + env(safe-area-inset-bottom));
   }
-  .brand{display:flex;flex-direction:column;align-items:center;gap:14px;margin-bottom:34px}
-  .brand .seal{
-    width:84px;height:84px;border-radius:26px;
-    background:linear-gradient(145deg,var(--gold),#9c7d1e);
-    display:flex;align-items:center;justify-content:center;
-    box-shadow:0 14px 40px -10px rgba(212,175,55,.5);
-  }
-  .brand .seal svg{width:42px;height:42px}
-  .brand h1{margin:0;font-size:23px;font-weight:600;letter-spacing:.3px}
-  .brand p{margin:0;color:var(--muted);font-size:13px;letter-spacing:.4px}
+  .brand{display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:22px;text-align:center}
+  .brand h1{margin:0;font-size:24px;font-weight:600;letter-spacing:.3px;text-shadow:0 2px 4px rgba(0,0,0,.55),0 2px 22px rgba(0,0,0,.7)}
+  .brand p{margin:0;color:#ececeb;font-size:13px;letter-spacing:.4px;text-shadow:0 1px 3px rgba(0,0,0,.6),0 1px 14px rgba(0,0,0,.65)}
   .card{
-    width:100%;max-width:380px;background:var(--surface);
-    border:1px solid var(--line);border-radius:var(--r);
-    padding:26px 22px;box-shadow:0 24px 60px -24px rgba(0,0,0,.7);
+    width:100%;max-width:380px;
+    background:rgba(24,24,27,.82);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+    border:1px solid rgba(255,255,255,.08);border-radius:var(--r);
+    padding:26px 22px;box-shadow:0 24px 60px -18px rgba(0,0,0,.8);
   }
   .field{margin-bottom:14px}
   .field label{display:block;font-size:12px;color:var(--muted);margin:0 0 7px 4px;letter-spacing:.3px}
@@ -264,14 +280,13 @@
 </head>
 <body>
 
+<!-- Fondo global (letrero Mixcoac) + capa oscura, detrás de todo -->
+<div id="bgLayer"></div>
+<div id="bgOverlay"></div>
+
 <!-- ============ LOGIN ============ -->
 <div id="loginView" class="login-wrap">
   <div class="brand">
-    <div class="seal">
-      <svg viewBox="0 0 24 24" fill="none" stroke="#1a1300" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>
-      </svg>
-    </div>
     <h1>Cerrada Mixcoac</h1>
     <p>Control de acceso residencial</p>
   </div>

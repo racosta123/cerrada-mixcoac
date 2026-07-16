@@ -110,6 +110,7 @@ auth.onAuthStateChanged(async user => {
 });
 
 function showLogin(){
+  document.body.classList.remove('in-app');   // fondo con capa suave en el login
   $('#appView').classList.add('hidden');
   $('#loginView').classList.remove('hidden');
   $('#password').value = '';
@@ -120,6 +121,7 @@ function showLogin(){
 }
 
 function enterApp(){
+  document.body.classList.add('in-app');   // fondo con capa ~85% en pantallas internas
   $('#loginView').classList.add('hidden');
   $('#appView').classList.remove('hidden');
   $('#avatar').textContent = (ME.nombre||'?').trim()[0].toUpperCase();

@@ -30,6 +30,15 @@ let unsubFin = null;
 let personasCache = [];       // padrón unificado (FASE 6.5): jefes (casas) + familiares + admins
 let miFamiliaCache = [];      // familiares del jefe en sesión (self-service en la pestaña Invitar)
 
+/* FASE 7 — modo de vista del jefe-admin (residente con esAdmin). COSMÉTICO: lo único que
+   hace es decidir qué pestañas se pintan. Vive en MEMORIA a propósito (no en localStorage)
+   para que quede obvio que no otorga permisos: el Worker revalida esAdmin contra Firestore
+   en CADA acción y las reglas hacen lo mismo. Falsificar MODO en F12 pinta la pestaña y
+   nada más — toda acción de admin responde 403. */
+let MODO = 'residente';                                   // 'residente' | 'admin'
+const puedeAdmin  = () => ME?.esAdmin === true;           // jefe con permiso de admin
+const enModoStaff = () => ME.rol === 'master' || ME.rol === 'admin' || (puedeAdmin() && MODO === 'admin');
+
 /* ====================== UTILIDADES ====================== */
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
@@ -127,6 +136,8 @@ function enterApp(){
   $('#avatar').textContent = (ME.nombre||'?').trim()[0].toUpperCase();
   $('#userName').textContent = ME.nombre || '—';
   $('#userRole').textContent = roleLabel(ME.rol) + (ME.casa ? ' · '+ME.casa : '');
+  MODO = 'residente';        // el jefe-admin siempre entra en su modo primario
+  renderModoBtn();
   buildTabs();
   renderDoors();
   watchLog();
@@ -140,13 +151,38 @@ function roleLabel(r){
   return { master:'Master', admin:'Administrador', residente:'Residente', esclavo:'Invitado' }[r] || r;
 }
 
+/* ====================== MODO (FASE 7) ====================== */
+/* El botón solo existe para el jefe-admin: master y admin puro no tienen lado residente
+   (sin casa, sin cuota, sin familiares), así que su "modo residente" sería una pantalla
+   vacía. Ellos siguen viendo su staff de siempre, sin botón. */
+function renderModoBtn(){
+  const b = $('#modoBtn');
+  b.classList.toggle('hidden', !puedeAdmin());
+  if (!puedeAdmin()) return;
+  const aAdmin = MODO === 'residente';        // a dónde lleva el botón
+  b.classList.toggle('on', MODO === 'admin');
+  b.innerHTML = aAdmin
+    ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span>Modo administrador</span>`
+    : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg><span>Modo residente</span>`;
+}
+$('#modoBtn').addEventListener('click', () => {
+  if (!puedeAdmin()) return;                  // sin permiso el botón ni existe
+  MODO = MODO === 'admin' ? 'residente' : 'admin';
+  renderModoBtn();
+  buildTabs();                                // repinta pestañas...
+  watchLog();                                 // ...y las vistas que dependen del modo
+  watchFinanzas();
+  toast(MODO === 'admin' ? 'Modo administrador' : 'Modo residente', 'ok');
+});
+
 /* ====================== TABS ====================== */
 function buildTabs(){
-  const isStaff = (ME.rol==='master' || ME.rol==='admin');
+  const isStaff = enModoStaff();
   const tabs = [
     { id:'doors',   label:'Puertas', icon:'M4 10h16v11H4z M8 10V7a4 4 0 0 1 8 0v3' },
   ];
-  if (ME.rol==='residente' || ME.rol==='esclavo')
+  // Invitar es del lado residente: el jefe-admin en modo admin no la ve.
+  if (!isStaff && (ME.rol==='residente' || ME.rol==='esclavo'))
     tabs.push({ id:'invites', label:'Invitar', icon:'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M19 8v6 M22 11h-6' });
   tabs.push({ id:'log', label: isStaff?'Bitácora':'Historial', icon:'M9 11l3 3L22 4 M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11' });
   tabs.push({ id:'finanzas', label:'Finanzas', icon:'M12 1v22 M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6' });
@@ -162,6 +198,10 @@ function buildTabs(){
     b.onclick = ()=> switchTab(t.id, b);
     bar.appendChild(b);
   });
+  // Al reconstruir por un cambio de modo, el pane abierto puede ya no tener pestaña
+  // (p.ej. Invitar al pasar a admin): vuelve siempre a la primera para no dejarlo huérfano.
+  $$('.tabpane').forEach(p => p.classList.add('hidden'));
+  $('#tab-'+tabs[0].id).classList.remove('hidden');
   if (isStaff) loadPersonas();
 }
 
@@ -211,7 +251,7 @@ async function openDoor(door, el){
 /* ====================== BITÁCORA / HISTORIAL ====================== */
 function watchLog(){
   if (unsubLog) unsubLog();
-  const isStaff = (ME.rol==='master' || ME.rol==='admin');
+  const isStaff = enModoStaff();
   let q = db.collection('aperturas').orderBy('ts','desc').limit(60);
   if (!isStaff){
     // residente ve lo suyo + sus esclavos/visitantes; esclavo ve lo suyo
@@ -426,6 +466,8 @@ function personaRow(p){
     : `<span class="tag in">Activo</span>`;
   const tagCuenta = esMaster ? `<span class="tag">Master</span>`
     : (p.registrado ? `<span class="tag in">Registrado</span>` : `<span class="tag">Sin cuenta</span>`);
+  // FASE 7: un jefe con permiso de admin se distingue en el padrón.
+  const tagAdmin = p.esAdmin ? `<span class="tag">🛡 Admin</span>` : '';
 
   // Acciones (delegadas por data-act). Al master no se le toca; tampoco a tu propia fila.
   let acts = '';
@@ -436,6 +478,10 @@ function personaRow(p){
       acts += `<button class="row-act" data-act="invitar" data-id="${p.id}">📲 Invitar</button>`;
     if (susp) acts += `<button class="row-act" data-act="reactivar" data-id="${p.id}">Reactivar</button>`;
     else      acts += `<button class="row-act danger" data-act="suspender" data-id="${p.id}">Suspender</button>`;
+    // Permiso de admin: SOLO master, y solo sobre un jefe de familia (el Worker revalida
+    // las dos cosas). Un familiar no puede serlo; un admin puro ya es staff por su rol.
+    if (ME.rol === 'master' && !esFam && !esAdmin)
+      acts += `<button class="row-act" data-act="admin" data-id="${p.id}">${p.esAdmin ? 'Quitar admin' : '🛡 Hacer admin'}</button>`;
     if (ME.rol === 'master')
       acts += `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
   }
@@ -443,7 +489,7 @@ function personaRow(p){
   return `<div class="row">`
       + `<div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
       + `<div class="rt"><div class="a">${titulo}</div>${sub?`<div class="b">${sub}</div>`:''}</div>`
-      + `<div class="tags">${tagEstado}${tagCuenta}</div>`
+      + `<div class="tags">${tagEstado}${tagAdmin}${tagCuenta}</div>`
     + `</div>` + (acts ? `<div class="persona-acts">${acts}</div>` : '');
 }
 
@@ -457,9 +503,25 @@ $('#personasList')?.addEventListener('click', e => {
     case 'invitar':   invitarPersona(p, b); break;
     case 'suspender': cambiarEstadoPersona(p, 'suspender', b); break;
     case 'reactivar': cambiarEstadoPersona(p, 'reactivar', b); break;
+    case 'admin':     cambiarAdminPersona(p, b); break;
     case 'borrar':    abrirPersonaDelSheet(p); break;
   }
 });
+
+/* -------- permiso de admin sobre un jefe (FASE 7) — solo master. El front solo pinta el
+   botón; /personas/admin revalida master + que el objetivo sea jefe, server-side. -------- */
+async function cambiarAdminPersona(p, btn){
+  const dar = !p.esAdmin;
+  const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/admin', { id: p.id, esAdmin: dar });
+    toast(dar ? `${p.nombre} ya es administrador` : `${p.nombre} dejó de ser administrador`, 'ok');
+    await refrescarPersonas();
+  } catch(e){
+    toast(e.message || 'No se pudo cambiar el permiso', 'bad');
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
 
 /* -------- alta / edición de persona (jefe o admin). El familiar se crea al invitarlo. -------- */
 let personaEditId = null;   // null = alta; id = edición
@@ -777,7 +839,7 @@ const monthKey = ts => { const d = ts.toDate ? ts.toDate() : new Date(ts); retur
 
 function watchFinanzas(){
   if (unsubFin) unsubFin();
-  const isStaff = (ME.rol==='master' || ME.rol==='admin');
+  const isStaff = enModoStaff();
 
   // Detalle de movimientos, gráficas y morosos: solo staff. Residentes/esclavos ya no
   // leen "finanzas" directo (bloqueado por Firestore rules) — reciben solo el agregado
@@ -831,7 +893,7 @@ function renderTermometro(pagaron, totalCasas){
   if (!totalCasas){
     fill.style.width = '0%';
     fill.className = 'therm-fill';
-    const isStaff = (ME.rol==='master' || ME.rol==='admin');
+    const isStaff = enModoStaff();
     $('#thermText').textContent = isStaff
       ? 'Da de alta casas en Gestión para activar el termómetro.'
       : 'El termómetro aún no está disponible.';

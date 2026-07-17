@@ -66,7 +66,7 @@
 <div class="card">
   <div class="brand">
     <div class="logo">M</div>
-    <div><h1>Cerrada Mixcoac</h1><p>REGISTRO DE RESIDENTE</p></div>
+    <div><h1>Cerrada Mixcoac</h1><p id="brandSub">REGISTRO DE RESIDENTE</p></div>
   </div>
 
   <!-- Estado: validando -->
@@ -99,7 +99,7 @@
   <div id="doneState" class="hidden center">
     <div class="big-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></div>
     <h2>¡Cuenta creada!</h2>
-    <p class="lead">Tu domicilio quedó vinculado. Instala la app y entra con tu correo y contraseña.</p>
+    <p class="lead" id="doneLead">Tu domicilio quedó vinculado. Instala la app y entra con tu correo y contraseña.</p>
     <button class="btn hidden" id="installBtn">📲 Instalar app</button>
     <a href="index.html"><button class="btn btn-ghost">Abrir la app</button></a>
   </div>
@@ -134,8 +134,16 @@
   (async () => {
     try {
       const v = await api('/invitaciones/validar', { token });
-      $('#veDomicilio').textContent = v.domicilio || '—';
+      // Un admin PURO no tiene domicilio en el padrón, así que el texto de residente no le
+      // queda. (Un jefe-admin sí lo tiene: se registra como la casa que es, y ve el texto
+      // normal — el permiso de admin se lo da el master después, no el registro.)
+      const soloAdmin = !v.domicilio;
+      $('#brandSub').textContent = soloAdmin ? 'REGISTRO DE ADMINISTRADOR' : 'REGISTRO DE RESIDENTE';
+      $('#veDomicilio').textContent = soloAdmin ? 'Administración' : v.domicilio;
       $('#veNombre').textContent = v.nombre || '';
+      $('#doneLead').textContent = soloAdmin
+        ? 'Tu cuenta de administrador quedó lista. Instala la app y entra con tu correo y contraseña.'
+        : 'Tu domicilio quedó vinculado. Instala la app y entra con tu correo y contraseña.';
       show('formState');
     } catch(e){
       $('#invalidMsg').textContent = 'Este enlace no es válido, ya se usó o venció. Pídele a la administración una invitación nueva.';

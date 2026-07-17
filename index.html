@@ -106,6 +106,16 @@
     border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--muted);
   }
   .icon-btn svg{width:20px;height:20px}
+  .topbar .acts{display:flex;align-items:center;gap:8px}
+  /* Botón de modo (FASE 7): solo lo ve el jefe-admin. Cambia qué pestañas se pintan. */
+  #modoBtn{
+    display:flex;align-items:center;gap:6px;height:40px;padding:0 12px;border-radius:13px;
+    background:var(--surface);border:1px solid var(--line);color:var(--gold-soft);
+    font-size:12px;font-weight:600;white-space:nowrap;
+  }
+  #modoBtn svg{width:15px;height:15px;flex-shrink:0}
+  #modoBtn:active{transform:scale(.96)}
+  #modoBtn.on{background:var(--gold-dim);border-color:rgba(212,175,55,.45)}
 
   .section-title{font-size:13px;color:var(--muted);letter-spacing:.5px;margin:22px 4px 12px;text-transform:uppercase}
 
@@ -314,11 +324,15 @@
         <div class="role" id="userRole">—</div>
       </div>
     </div>
-    <button class="icon-btn" id="logoutBtn" title="Salir">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
-      </svg>
-    </button>
+    <div class="acts">
+      <!-- FASE 7: solo se muestra si ME.esAdmin. Cosmético: el permiso lo revalida el Worker. -->
+      <button id="modoBtn" class="hidden"></button>
+      <button class="icon-btn" id="logoutBtn" title="Salir">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+      </button>
+    </div>
   </div>
 
   <!-- TAB: PUERTAS -->

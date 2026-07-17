@@ -2,10 +2,18 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function rol() {
-      return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.rol;
+    function perfil() {
+      return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data;
     }
-    function staff() { return rol() in ['master','admin']; }
+    // FASE 7 — staff = master/admin, o un JEFE con esAdmin:true y ACTIVO (jefe-admin).
+    // Misma regla que esStaff() en el Worker, a los dos lados: un jefe suspendido por mora
+    // pierde los poderes de admin. get(campo, default) tolera los docs viejos que aún no
+    // tienen esAdmin/estado. El permiso lo escribe SOLO el Worker (usuarios es de solo
+    // lectura para el cliente: create/delete false y update limitado a fcmToken).
+    function staff() {
+      return perfil().rol in ['master','admin']
+          || (perfil().get('esAdmin', false) == true && perfil().get('estado', 'activo') == 'activo');
+    }
     function signedIn() { return request.auth != null; }
 
     // ---- usuarios ----

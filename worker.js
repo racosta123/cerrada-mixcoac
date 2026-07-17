@@ -23,9 +23,28 @@ const DEVICES = {
 };
 const STAFF = new Set(['master','admin']);
 
+/* FASE 7 — esAdmin: un JEFE de familia (rol 'residente' sin jefeId) puede tener además
+   esAdmin:true y ganar poderes de staff, conservando casa/cuota/voto/familiares. NO es una
+   segunda cuenta ni un rol nuevo: es un permiso aditivo que SOLO el master prende/apaga
+   (/personas/admin). El "modo" del front es cosmético; el permiso real se decide AQUÍ,
+   releyendo el perfil de Firestore en cada petición.
+   El check de estado va solo en la rama esAdmin: master/admin no se suspenden, pero un jefe
+   SÍ (por mora) — y un jefe suspendido no debe conservar los poderes de admin. */
+function esStaff(p) {
+  if (!p) return false;
+  if (STAFF.has(p.rol)) return true;
+  return p.esAdmin === true && (p.estado || 'activo') === 'activo';
+}
+/* Vista de "persona del padrón" (no del perfil): a un staff solo lo toca el MASTER — un
+   admin no suspende, reactiva ni edita a otro admin. */
+function esStaffPersona(p) {
+  return !!p && (p.rol === 'master' || p.rol === 'admin' || p.esAdmin === true);
+}
+
 // SOLO DESARROLLO: permite probar el Worker desde el servidor local de pruebas.
-// Quitar esta línea cuando ya no se necesite probar desde localhost.
-const DEV_ORIGINS = [];
+// TEMPORAL FASE 7: se quita en el commit final (chore: quitar DEV_ORIGINS) y se verifica
+// con un preflight que localhost quede cerrado y solo pase GitHub Pages.
+const DEV_ORIGINS = ['http://localhost:4173'];
 
 export default {
   async fetch(req, env) {
@@ -61,6 +80,7 @@ export default {
         case '/personas/suspender': out = await suspenderPersona(req, env); break;
         case '/personas/reactivar': out = await reactivarPersona(req, env); break;
         case '/personas/borrar':    out = await borrarPersona(req, env); break;
+        case '/personas/admin':     out = await adminPersona(req, env); break;
         case '/personas/listar':    out = await listarPersonas(req, env); break;
         case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
         case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
@@ -174,7 +194,7 @@ async function validarQR(req, env) {
 async function suspenderUsuario(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'No autorizado');
+  if (!esStaff(perfil)) throw httpErr(403, 'No autorizado');
 
   const { uid, suspendido } = await req.json();
   if (!uid || typeof suspendido !== 'boolean') throw httpErr(400, 'Datos inválidos');
@@ -253,7 +273,7 @@ async function borrarUsuario(req, env) {
 async function registrarFinanza(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo master/admin registran finanzas');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo master/admin registran finanzas');
 
   const { tipo, concepto, categoria, monto, casa } = await req.json();
   if (!['ingreso','egreso'].includes(tipo)) throw httpErr(400, 'Tipo inválido');
@@ -293,6 +313,16 @@ async function registrarFinanza(req, env) {
     creadoNombre:{stringValue:perfil.nombre||''},
     ts:{timestampValue:new Date().toISOString()},
   });
+
+  // FASE 7 — autocobro: un jefe-admin puede registrar el pago de SU PROPIA casa (es admin y
+  // es casa a la vez). Es legítimo, pero no debe ser invisible: queda en la bitácora. Borrar
+  // movimientos sigue siendo solo-master, así que no puede tapar su propio rastro.
+  if (perfil.esAdmin === true && casaCanon && normDomicilio(perfil.casa || '') === normDomicilio(casaCanon)) {
+    await logBitacora(env, await saToken(env, 'https://www.googleapis.com/auth/datastore'), {
+      uid: user.uid,
+      nombre: `${perfil.nombre || 'Admin'} registró un pago de su propia casa (${casaCanon}) por ${m}`,
+    });
+  }
   return json({ ok:true, id, folioRecibo });
 }
 
@@ -331,7 +361,7 @@ async function siguienteFolioRecibo(env) {
 async function marcarRecibo(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo master/admin');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo master/admin');
 
   const { id, accion } = await req.json();
   if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
@@ -392,7 +422,7 @@ function normDomicilio(s) {
 async function crearVecino(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff da de alta vecinos');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff da de alta vecinos');
 
   const { nombre, correo, telefono, domicilio } = await req.json();
   const nom = String(nombre || '').trim().slice(0, 80);
@@ -430,7 +460,7 @@ async function crearVecino(req, env) {
 async function actualizarVecino(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff edita vecinos');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff edita vecinos');
 
   const { id, nombre, correo, telefono, domicilio, estado } = await req.json();
   if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
@@ -470,7 +500,7 @@ async function actualizarVecino(req, env) {
 async function listarVecinos(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff consulta el padrón');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff consulta el padrón');
 
   const docs = await firestoreList(env, 'vecinos');
   const vecinos = docs.map(d => {
@@ -601,7 +631,7 @@ async function leerInvitacionValida(env, at, token) {
 async function crearInvitacionRegistro(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff genera invitaciones');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff genera invitaciones');
 
   const { personaId } = await req.json();
   if (!personaId || !/^[A-Za-z0-9-]{10,64}$/.test(personaId)) throw httpErr(400, 'personaId inválido');
@@ -819,6 +849,7 @@ async function syncUsuarioIndex(env, at, persona, byId) {
     suspendido:{booleanValue: (persona.estado || 'activo') === 'suspendido'},
     personaId:{stringValue: persona.id},
     jefeId:{stringValue: persona.jefeId || ''},
+    esAdmin:{booleanValue: persona.esAdmin === true},   // FASE 7: lo leen esStaff() y staff() de las reglas
   };
   if (persona.correo) fields.email = {stringValue: persona.correo};
   await firestoreUpdate(env, `usuarios/${persona.uid}`, fields, Object.keys(fields));
@@ -838,7 +869,7 @@ async function resyncFamilia(env, at, personaId, incluirFamiliares) {
 async function crearPersona(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff da de alta personas');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff da de alta personas');
 
   const { nombre, telefono, domicilio, rol } = await req.json();
   const nom = String(nombre || '').trim().slice(0, 80);
@@ -867,6 +898,7 @@ async function crearPersona(req, env) {
     domicilioNorm:{stringValue:domNorm},
     rol:{stringValue:rol},
     estado:{stringValue:'activo'},
+    esAdmin:{booleanValue:false},        // FASE 7: solo el master lo prende, vía /personas/admin
     uid:{nullValue:null},
     jefeId:{nullValue:null},
     suspendidoPor:{nullValue:null},
@@ -881,7 +913,7 @@ async function crearPersona(req, env) {
 async function actualizarPersona(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff edita personas');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff edita personas');
 
   const { id, nombre, telefono, domicilio } = await req.json();
   if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
@@ -889,6 +921,7 @@ async function actualizarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(p => byId[p.id] = p);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede editar a un administrador');
 
   const fields = {};
   if (nombre !== undefined) { const nom = String(nombre).trim().slice(0,80); if (!nom) throw httpErr(400,'El nombre no puede quedar vacío'); fields.nombre = {stringValue:nom}; }
@@ -922,7 +955,7 @@ async function actualizarPersona(req, env) {
 async function suspenderPersona(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff suspende personas');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff suspende personas');
 
   const { id } = await req.json();
   if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
@@ -931,6 +964,7 @@ async function suspenderPersona(req, env) {
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
   if (p.rol === 'master') throw httpErr(403, 'No se puede suspender un master');
+  if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede suspender a un administrador');
 
   await firestoreActualizarCampos(env, `personas/${id}`, { estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'individual'} }, 'Persona');
   if (esJefe(p)) {
@@ -948,7 +982,7 @@ async function suspenderPersona(req, env) {
 async function reactivarPersona(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff reactiva personas');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff reactiva personas');
 
   const { id } = await req.json();
   if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
@@ -956,6 +990,7 @@ async function reactivarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede reactivar a un administrador');
   if (p.jefeId) {
     const jefe = byId[p.jefeId];
     if (jefe && jefe.estado === 'suspendido') throw httpErr(409, 'Reactiva primero al jefe de familia (la casa está suspendida).');
@@ -1017,12 +1052,41 @@ async function borrarPersona(req, env) {
   return json({ ok:true, id });
 }
 
+/* /personas/admin — SOLO MASTER. Prende/apaga esAdmin sobre un JEFE de familia. El check es
+   perfil.rol === 'master' (NO esStaff): un admin —puro o jefe-admin— no puede otorgárselo a
+   sí mismo ni a nadie más. Funciona aunque el jefe aún no tenga cuenta: syncUsuarioIndex
+   proyecta el permiso cuando se registre. */
+async function adminPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master otorga permisos de administrador');
+
+  const { id, esAdmin } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  if (typeof esAdmin !== 'boolean') throw httpErr(400, 'esAdmin debe ser true o false');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const p = all.find(x => x.id === id);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  // Solo un jefe: bloquea familiares (heredan domicilio), admins puros (ya son staff) y master.
+  if (!esJefe(p)) throw httpErr(400, 'Solo un jefe de familia puede ser administrador');
+
+  await firestoreActualizarCampos(env, `personas/${id}`, { esAdmin:{booleanValue:esAdmin} }, 'Persona');
+  await resyncFamilia(env, at, id, false);
+  await logBitacora(env, at, {
+    uid: user.uid,
+    nombre: `${perfil.nombre || 'Master'} ${esAdmin ? 'nombró administrador a' : 'quitó el permiso de administrador a'} ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}`,
+  });
+  return json({ ok:true, id, esAdmin });
+}
+
 /* /personas/listar — SOLO staff. Devuelve todo el padrón con domicilio resuelto (familiar
    hereda el del jefe) + el conteo de CASAS ACTIVAS (jefes activos) para el termómetro. */
 async function listarPersonas(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff consulta el padrón');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff consulta el padrón');
 
   const all = await personasList(env);
   const byId = {}; all.forEach(p => byId[p.id] = p);
@@ -1032,6 +1096,7 @@ async function listarPersonas(req, env) {
     jefeId: p.jefeId ?? null, suspendidoPor: p.suspendidoPor ?? null,
     domicilio: domicilioDe(p, byId), domicilioNorm: p.domicilioNorm || '',
     registrado: !!p.uid,
+    esAdmin: p.esAdmin === true,   // FASE 7: para la etiqueta y el botón de master en Gestión
   }));
   const casasActivas = all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
   return json({ personas, casasActivas });
@@ -1104,7 +1169,7 @@ async function resumenFinanzas(req, env) {
 async function cobranzaFinanzas(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'Solo staff consulta la cobranza');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff consulta la cobranza');
 
   const now = new Date();
   const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -1136,7 +1201,7 @@ async function cobranzaFinanzas(req, env) {
 async function crearUsuario(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || !STAFF.has(perfil.rol)) throw httpErr(403, 'No autorizado');
+  if (!esStaff(perfil)) throw httpErr(403, 'No autorizado');
 
   const { nombre, email, password, rol, casa } = await req.json();
   if (!nombre || !email || !password || password.length < 8) throw httpErr(400, 'Datos inválidos');

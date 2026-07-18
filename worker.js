@@ -41,15 +41,10 @@ function esStaffPersona(p) {
   return !!p && (p.rol === 'master' || p.rol === 'admin' || p.esAdmin === true);
 }
 
-// SOLO DESARROLLO: permite probar el Worker desde el servidor local de pruebas.
-// TEMPORAL FASE 7: se quita en el commit final (chore: quitar DEV_ORIGINS) y se verifica
-// con un preflight que localhost quede cerrado y solo pase GitHub Pages.
-const DEV_ORIGINS = ['http://localhost:4173'];
-
 export default {
   async fetch(req, env) {
     const reqOrigin = req.headers.get('Origin') || '';
-    const allowed = new Set([env.ALLOWED_ORIGIN, ...DEV_ORIGINS].filter(Boolean));
+    const allowed = new Set([env.ALLOWED_ORIGIN].filter(Boolean));
     const origin = allowed.has(reqOrigin) ? reqOrigin : (env.ALLOWED_ORIGIN || '*');
     if (req.method === 'OPTIONS') return cors(new Response(null,{status:204}), origin);
 

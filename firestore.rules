@@ -68,5 +68,37 @@ service cloud.firestore {
       // SOLO el Worker escribe (tras verificar rol master/admin)
       allow write: if false;
     }
+
+    // ---- votaciones (FASE V1) ----
+    // La votación y su conteo en vivo los ve cualquier vecino autenticado (resultados
+    // públicos = requisito del negocio). El umbral para mostrar el conteo NO se aplica
+    // aquí: el Worker no escribe el campo "conteo" hasta participaronCount >= umbralConteo.
+    match /votaciones/{id} {
+      allow read:  if signedIn();
+      allow write: if false;
+
+      // Lista de participación: NADIE la lee directo. Los dos candados (bloque de 5 y
+      // 1 actualización/hora por admin) son temporales y con estado — no se pueden
+      // expresar en reglas. Se sirve SOLO por el Worker, que devuelve nombres en bloques
+      // completos de 5, en orden aleatorio, sin timestamp ni "orden". El master NO gestiona.
+      match /participacion/{casaId} {
+        allow read:  if false;
+        allow write: if false;
+      }
+
+      // Liga casa->opción (opcionActual, mínima para cambiar el voto; el Worker la borra
+      // al congelar), tally interno en vivo, y throttle 1/hora por admin. Todo Worker-only.
+      match /_privado/{doc} {
+        allow read:  if false;
+        allow write: if false;
+      }
+    }
+
+    // ---- control (una sola votación activa a la vez) ----
+    // Puntero singleton activaId. Lo leen master/admin/jefe-admin; el master solo lee.
+    match /control/{doc} {
+      allow read:  if signedIn() && staff();
+      allow write: if false;
+    }
   }
 }

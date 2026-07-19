@@ -186,6 +186,7 @@ function buildTabs(){
     tabs.push({ id:'invites', label:'Invitar', icon:'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M19 8v6 M22 11h-6' });
   tabs.push({ id:'log', label: isStaff?'Bitácora':'Historial', icon:'M9 11l3 3L22 4 M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11' });
   tabs.push({ id:'finanzas', label:'Finanzas', icon:'M12 1v22 M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6' });
+  tabs.push({ id:'votaciones', label:'Votación', icon:'M5 8h14v12H5z M9 12l2 2 4-4 M8 8V6a4 4 0 0 1 8 0v2' });
   if (isStaff)
     tabs.push({ id:'admin', label:'Gestión', icon:'M12 2a3 3 0 0 1 3 3v1m-6 0V5a3 3 0 0 1 3-3 M4 9h16v11H4z' });
 
@@ -214,7 +215,9 @@ function switchTab(id, btn){
   $('#tab-'+id).classList.remove('hidden');
   $$('.tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
+  if (id !== 'votaciones' && votUnsub){ votUnsub(); votUnsub = null; }
   if (id === 'finanzas') resizeFinCharts();
+  if (id === 'votaciones') loadVotaciones();
 }
 
 /* ====================== PUERTAS ====================== */
@@ -1943,6 +1946,302 @@ async function registerPush(){
     messaging.onMessage(p => toast(p.notification?.body || 'Movimiento en tu hogar'));
   } catch(e){ console.warn('Push no disponible', e); }
 }
+
+/* ====================== VOTACIONES (FASE V3) ======================
+   El front SOLO consume los 7 endpoints + un listener de Firestore sobre el doc
+   PÚBLICO votaciones/{id} (permitido por reglas) para el marcador en vivo. No valida
+   roles ni permisos: si un endpoint devuelve 403, se muestra el mensaje tal cual. El
+   mostrar/ocultar controles de admin es cosmético; el Worker es el que manda. */
+let votData = null;        // respuesta de /votaciones/estado: { activa, yo }
+let votUnsub = null;       // listener de Firestore del marcador en vivo
+let votSeg = 'actual';     // 'actual' | 'anteriores'
+let votChanging = false;   // el jefe está cambiando su voto
+let votSel = null;         // opción seleccionada (id) al votar/cambiar
+let votNominalCache = null;// última lista nominal cargada (para conservarla en throttle)
+
+function votEsc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function votErr(e){
+  const m = (e && e.message) || '';
+  if (/failed to fetch|networkerror|load failed|network request failed/i.test(m)) return 'Sin conexión. Revisa tu internet.';
+  if (/token/i.test(m)) return 'Tu sesión expiró. Vuelve a iniciar sesión.';
+  return m || 'Algo salió mal';
+}
+function votOpTexto(v, id){ const o=(v.opciones||[]).find(x=>x.id===id); return o?o.texto:''; }
+function votGanadora(v){ let best=null; for(const o of (v.opciones||[])){ const n=(v.conteo||{})[o.id]||0; if(!best||n>best.n) best={id:o.id,texto:o.texto,n}; } return best&&best.n>0?best:null; }
+function votFecha(iso){ if(!iso) return ''; const d=new Date(iso); if(isNaN(d)) return ''; return d.toLocaleDateString('es-MX',{day:'numeric',month:'short'})+', '+d.toLocaleTimeString('es-MX',{hour:'numeric',minute:'2-digit'}); }
+function votFechaDia(iso){ if(!iso) return ''; const d=new Date(iso); if(isNaN(d)) return ''; return d.toLocaleDateString('es-MX',{day:'numeric',month:'long',year:'numeric'}); }
+function votBaja(v){ return v.totalCasas>0 && v.participaronCount < v.totalCasas/2; }
+
+function loadVotaciones(){ votSwitchSeg(votSeg || 'actual'); }
+function votSwitchSeg(seg){
+  votSeg = seg;
+  $$('#votSeg button').forEach(b => b.classList.toggle('sel', b.dataset.seg===seg));
+  $('#votActual').classList.toggle('hidden', seg!=='actual');
+  $('#votHist').classList.toggle('hidden', seg!=='anteriores');
+  if (seg==='actual') votCargarActual();
+  else { if (votUnsub){ votUnsub(); votUnsub=null; } votCargarHistorial(); }
+}
+
+/* ---- Actual: votación activa (o su ausencia) ---- */
+async function votCargarActual(){
+  const c = $('#votActual');
+  if (!votData) c.innerHTML = '<div class="empty">Cargando votación…</div>';
+  try {
+    votChanging = false; votSel = null;
+    votData = await authedFetch('/votaciones/estado', {});
+    votRenderActual();
+    if (votData.activa) votAttachListener(votData.activa.id);
+    else if (votUnsub){ votUnsub(); votUnsub=null; }
+  } catch(e){
+    c.innerHTML = `<div class="empty">${votEsc(votErr(e))}<br><button class="btn-ghost" id="vReintentar" style="margin-top:12px">Reintentar</button></div>`;
+    const b=$('#vReintentar'); if(b) b.onclick = votCargarActual;
+  }
+}
+
+function votAttachListener(id){
+  if (votUnsub){ votUnsub(); votUnsub=null; }
+  votUnsub = db.collection('votaciones').doc(id).onSnapshot(snap => {
+    const d = snap.data();
+    if (!d || !votData || !votData.activa || votData.activa.id!==id) return;
+    // Si un admin la cerró (archivó), recargamos: /estado devolverá activa:null.
+    if (d.estado==='cerrada' && votData.activa.estado!=='cerrada'){ votCargarActual(); return; }
+    votData.activa.conteo = d.conteo || null;
+    votData.activa.conteoOculto = !d.conteo;
+    votData.activa.participaronCount = d.participaronCount || 0;
+    votRenderMarcador();
+  }, ()=>{});
+}
+
+function votRenderActual(){
+  const c = $('#votActual');
+  const puedeGestionar = enModoStaff() && ME.rol!=='master';   // cosmético; el Worker revalida
+  const staffLee = enModoStaff();                              // ve lista nominal (incluye master)
+
+  if (!votData || !votData.activa){
+    let h = '<div class="empty">No hay ninguna votación en curso.<br><span style="font-size:12px;color:var(--muted-2)">Cuando la administración abra una votación, aparecerá aquí.</span></div>';
+    if (puedeGestionar) h += '<button class="btn-primary" id="vcCrearBtn" style="margin-top:6px">Crear votación</button>';
+    h += '<button class="btn-ghost" id="vIrHist" style="width:100%;margin-top:10px">Ver votaciones anteriores</button>';
+    c.innerHTML = h; return;
+  }
+
+  const v = votData.activa, yo = votData.yo || {};
+  const cerrada = v.estado==='cerrada', congelada = v.estado==='congelada';
+  let h = `<div class="vhead"><div class="q">${votEsc(v.titulo)}</div>`;
+  if (v.descripcion) h += `<div class="d">${votEsc(v.descripcion)}</div>`;
+  const chip = cerrada ? {cls:'', t:'Votación cerrada · resultado final'}
+             : congelada ? {cls:'warn', t:'Cierra '+votFecha(v.cierraAt)}
+             : {cls:'abierta', t:'Abierta · cierra '+votFecha(v.cierraAt)};
+  h += `<span class="vchip ${chip.cls}">${chip.t}</span></div>`;
+
+  if (congelada) h += `<div class="vbanner"><b>Los votos ya no se pueden cambiar.</b><br>Falta menos de un día para el cierre. Para que el resultado sea firme, los votos quedaron fijos.</div>`;
+
+  // Tarjeta de voto: solo el jefe con casa (yo.esJefe lo dice el Worker), y si no está cerrada.
+  if (yo.esJefe && !cerrada){
+    if (votChanging && yo.yaVotaste){
+      h += `<div class="vopts">`+v.opciones.map(o=>`<button class="vopt ${votSel===o.id?'sel':''}" data-op="${o.id}"><span class="dot"></span><span class="ot">${votEsc(o.texto)}</span></button>`).join('')+`</div>`;
+      h += `<button class="btn-primary" id="vEnviar">Guardar cambio</button>`;
+      h += `<button class="btn-ghost" id="vCancelarCambio" style="width:100%;margin-top:10px">Cancelar</button>`;
+    } else if (yo.yaVotaste){
+      if (congelada){
+        h += `<div class="vfrozen">Tu voto quedó registrado y cuenta para el resultado.<p class="vnote" style="margin-top:6px">Por privacidad, cuando los votos se fijan dejamos de mostrar qué elegiste.</p></div>`;
+      } else {
+        h += `<div class="vmine">Ya votaste ✓${yo.miOpcionActual?` · Tu voto: <b>${votEsc(votOpTexto(v,yo.miOpcionActual))}</b>`:''}</div>`;
+        h += `<button class="btn-ghost" id="vCambiar" style="width:100%;margin-top:12px">Cambiar mi voto</button>`;
+      }
+    } else {
+      h += `<div class="vopts">`+v.opciones.map(o=>`<button class="vopt ${votSel===o.id?'sel':''}" data-op="${o.id}"><span class="dot"></span><span class="ot">${votEsc(o.texto)}</span></button>`).join('')+`</div>`;
+      if (congelada) h += `<p class="vnote" style="margin:0 0 12px 2px">Puedes votar, pero ya no podrás cambiarlo.</p>`;
+      h += `<button class="btn-primary" id="vEnviar"${votSel?'':' disabled'}>Enviar mi voto</button>`;
+    }
+  } else if (yo.esJefe===false && !staffLee){
+    h += `<p class="vnote" style="margin:14px 2px">El voto de tu casa lo emite el jefe de familia.</p>`;
+  }
+
+  h += `<div class="section-title">Resultados en vivo</div><div id="votMarcador"></div>`;
+
+  if (staffLee){
+    h += `<div class="vadmin"><div class="section-title" style="margin-top:0">Quién ha votado</div>`;
+    h += `<p class="vnote" style="margin:0 0 10px 2px">Para proteger el voto secreto, los nombres se revelan de 5 en 5. Los últimos aparecen cuando se acumulan 5 votos más.</p>`;
+    h += `<button class="btn-ghost" id="vVerNominal" style="width:100%">Ver quién ha votado</button><div id="votNominal"></div>`;
+    if (puedeGestionar) h += `<button class="btn-ghost" id="vCerrar" style="width:100%;margin-top:14px;color:var(--bad);border-color:rgba(248,113,113,.4)">Cerrar votación</button>`;
+    h += `</div>`;
+  }
+
+  c.innerHTML = h;
+  votRenderMarcador();
+}
+
+function votRenderMarcador(){
+  const el = $('#votMarcador'); if (!el || !votData || !votData.activa) return;
+  const v = votData.activa;
+  if (!v.conteo || v.conteoOculto){
+    el.innerHTML = `<div class="vlocked"><div class="big">Los resultados se mostrarán cuando voten al menos ${v.umbralConteo||5} casas.</div>Van ${v.participaronCount||0}.</div>`;
+    return;
+  }
+  const total = Object.values(v.conteo).reduce((a,b)=>a+b,0);
+  const maxN = Math.max(0, ...Object.values(v.conteo));
+  const mine = (votData.yo && votData.yo.miOpcionActual) || null;
+  const bars = (v.opciones||[]).map(o=>{
+    const n=v.conteo[o.id]||0, pct=total?Math.round(n*100/total):0, win=n>0&&n===maxN;
+    return `<div class="vbar ${win?'win':''}"><div class="top"><span>${votEsc(o.texto)}${mine===o.id?' ●':''}</span><span class="n">${n} · ${pct}%</span></div><div class="track"><div class="fill" style="width:${pct}%"></div></div></div>`;
+  }).join('');
+  el.innerHTML = `<div class="vbars">${bars}</div><p class="vnote" style="margin-top:10px">Han votado ${v.participaronCount||0} de ${v.totalCasas||0} casas.</p>`;
+}
+
+/* Delegación de clicks en #votActual (sobrevive a los re-render de innerHTML) */
+$('#votActual')?.addEventListener('click', e => {
+  const opt = e.target.closest('.vopt');
+  if (opt){ votSelectOpt(opt.dataset.op); return; }
+  const id = e.target.closest('button') && e.target.closest('button').id;
+  if (id==='vEnviar') votEnviar();
+  else if (id==='vCambiar'){ votChanging=true; votSel = (votData.yo && votData.yo.miOpcionActual) || null; votRenderActual(); }
+  else if (id==='vCancelarCambio'){ votChanging=false; votSel=null; votRenderActual(); }
+  else if (id==='vVerNominal') votCargarNominal(e.target.closest('button'));
+  else if (id==='vCerrar') openSheet('#votCerrarOverlay');
+  else if (id==='vcCrearBtn') votAbrirCrear();
+  else if (id==='vIrHist') votSwitchSeg('anteriores');
+});
+function votSelectOpt(op){
+  votSel = op;
+  $$('#votActual .vopt').forEach(b => b.classList.toggle('sel', b.dataset.op===op));
+  const env = $('#vEnviar'); if (env) env.disabled = false;
+}
+async function votEnviar(){
+  if (!votSel) return;
+  const cambio = votData && votData.yo && votData.yo.yaVotaste;
+  const env = $('#vEnviar'); if (env){ env.disabled=true; env.innerHTML='<span class="spinner"></span>'; }
+  try {
+    await authedFetch('/votaciones/votar', { opcion: votSel });
+    toast(cambio ? 'Voto actualizado' : 'Voto registrado', 'ok');
+    votChanging=false; votSel=null; await votCargarActual();
+  } catch(e){ toast(votErr(e), 'bad'); await votCargarActual(); }
+}
+
+/* ---- Lista nominal (staff, con los candados en el Worker) ---- */
+async function votCargarNominal(btn){
+  const id = votData && votData.activa && votData.activa.id; if (!id) return;
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+  try {
+    votNominalCache = await authedFetch('/votaciones/participacion', { votacionId: id });
+    votRenderNominal(votNominalCache, '');
+  } catch(e){
+    votRenderNominal(votNominalCache, votErr(e));   // conserva la última lista (throttle)
+  } finally { btn.disabled=false; btn.textContent='Actualizar lista'; }
+}
+function votRenderNominal(r, msg){
+  const el = $('#votNominal'); if (!el) return;
+  let h = '';
+  if (msg) h += `<p class="vnote" style="color:var(--warn);margin:10px 2px">${votEsc(msg)} El límite de una vez por hora también cuida el anonimato.</p>`;
+  if (r){
+    h += r.nombres.length
+      ? '<div class="list" style="margin-top:10px">'+r.nombres.map(p=>`<div class="row"><div class="rt"><div class="a">${votEsc(p.casa)}</div><div class="b">${votEsc(p.nombre)}</div></div></div>`).join('')+'</div>'
+      : '<p class="vnote" style="margin:10px 2px">Aún no hay nombres para mostrar.</p>';
+    if (r.pendientesSinDesglosar>0) h += `<p class="vnote" style="margin:8px 2px">Hay ${r.pendientesSinDesglosar} voto(s) más que todavía no se pueden mostrar por nombre.</p>`;
+  }
+  el.innerHTML = h;
+}
+
+/* ---- Crear votación (admin/jefe-admin) ---- */
+function votAbrirCrear(){
+  $('#vcTitulo').value=''; $('#vcDesc').value=''; $('#vcErr').textContent='';
+  const box=$('#vcOpciones'); box.innerHTML=''; votAddOptInput(); votAddOptInput();
+  const cierre=$('#vcCierre'); cierre.value='';
+  const min=new Date(Date.now()+24*3600e3);
+  cierre.min=new Date(min.getTime()-min.getTimezoneOffset()*60000).toISOString().slice(0,16);
+  openSheet('#votCrearOverlay');
+}
+function votAddOptInput(){
+  const box=$('#vcOpciones');
+  const d=document.createElement('div');
+  d.className='field vc-optrow'; d.style.display='flex'; d.style.gap='8px'; d.style.alignItems='center';
+  d.innerHTML=`<input class="vc-opt" placeholder="Opción ${box.children.length+1}" style="flex:1"><button type="button" class="opt-del" title="Quitar">×</button>`;
+  box.appendChild(d);
+}
+async function votGuardar(){
+  const titulo=$('#vcTitulo').value.trim(), desc=$('#vcDesc').value.trim();
+  const opciones=[...document.querySelectorAll('#vcOpciones .vc-opt')].map(i=>i.value.trim()).filter(Boolean);
+  const cierreLocal=$('#vcCierre').value; $('#vcErr').textContent='';
+  if (titulo.length<3){ $('#vcErr').textContent='Escribe la pregunta (mínimo 3 letras).'; return; }
+  if (opciones.length<2){ $('#vcErr').textContent='Agrega al menos 2 opciones.'; return; }
+  if (!cierreLocal){ $('#vcErr').textContent='Elige la fecha y hora de cierre.'; return; }
+  const btn=$('#vcGuardar'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+  try {
+    await authedFetch('/votaciones/crear', { titulo, descripcion:desc, opciones, cierraAt:new Date(cierreLocal).toISOString() });
+    closeSheet('#votCrearOverlay'); toast('Votación abierta', 'ok'); votSwitchSeg('actual');
+  } catch(e){ $('#vcErr').textContent=votErr(e); }
+  finally { btn.disabled=false; btn.textContent='Abrir votación'; }
+}
+async function votCerrarConfirmar(){
+  const id = votData && votData.activa && votData.activa.id; if (!id) return;
+  const btn=$('#vcerrarConfirm'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span>'; $('#vcerrarErr').textContent='';
+  try {
+    await authedFetch('/votaciones/cerrar', { votacionId:id });
+    closeSheet('#votCerrarOverlay'); toast('Votación cerrada y archivada', 'ok'); votSwitchSeg('anteriores');
+  } catch(e){ $('#vcerrarErr').textContent=votErr(e); }
+  finally { btn.disabled=false; btn.textContent='Sí, cerrar y archivar'; }
+}
+
+/* ---- Historial (todos los residentes): lista y detalle de un acta ---- */
+async function votCargarHistorial(){
+  const c=$('#votHist'); c.innerHTML='<div class="empty">Cargando historial…</div>';
+  try {
+    const r = await authedFetch('/votaciones/historial', {});
+    if (!r.votaciones || !r.votaciones.length){
+      c.innerHTML='<div class="empty">Todavía no hay votaciones anteriores.<br><span style="font-size:12px;color:var(--muted-2)">Aquí quedará el acta de cada votación cerrada.</span></div>'; return;
+    }
+    c.innerHTML='<div class="section-title">Votaciones anteriores</div><div class="list" id="votHistList"></div>';
+    const list=$('#votHistList');
+    r.votaciones.forEach(v=>{
+      const win=votGanadora(v), baja=votBaja(v);
+      const el=document.createElement('button');
+      el.className='row'; el.style.width='100%'; el.style.textAlign='left';
+      el.innerHTML=`<div class="rt"><div class="a">${votEsc(v.titulo)}</div><div class="b">Cerrada ${votFechaDia(v.cerradaAt)}${win?' · '+votEsc(win.texto):''} · ${v.participaronCount} de ${v.totalCasas}</div></div>${baja?'<span class="tag susp">Participación baja</span>':''}`;
+      el.onclick=()=>votAbrirActa(v);
+      list.appendChild(el);
+    });
+  } catch(e){
+    c.innerHTML=`<div class="empty">${votEsc(votErr(e))}<br><button class="btn-ghost" id="vHistReintentar" style="margin-top:12px">Reintentar</button></div>`;
+    const b=$('#vHistReintentar'); if(b) b.onclick=votCargarHistorial;
+  }
+}
+async function votAbrirActa(v){
+  const c=$('#votHist'); c.innerHTML='<div class="empty">Cargando acta…</div>';
+  try {
+    const r = await authedFetch('/votaciones/participantes', { votacionId:v.id });
+    votRenderActa(v, r.nombres||[]);
+  } catch(e){
+    c.innerHTML=`<div class="empty">${votEsc(votErr(e))}<br><button class="btn-ghost" id="vActaBack" style="margin-top:12px">← Volver</button></div>`;
+    const b=$('#vActaBack'); if(b) b.onclick=votCargarHistorial;
+  }
+}
+function votRenderActa(v, nombres){
+  const total=Object.values(v.conteo||{}).reduce((a,b)=>a+b,0), win=votGanadora(v), baja=votBaja(v);
+  let h=`<button class="vback" id="vActaBack">← Volver al historial</button>`;
+  h+=`<div class="vhead"><div class="q">${votEsc(v.titulo)}</div>`;
+  if (v.descripcion) h+=`<div class="d">${votEsc(v.descripcion)}</div>`;
+  h+=`<div class="vnote" style="margin-top:8px">Cerrada ${votFechaDia(v.cerradaAt)}</div>`;
+  if (baja) h+=`<span class="vchip warn">Participación baja · votaron ${v.participaronCount} de ${v.totalCasas} casas</span>`;
+  h+=`</div>`;
+  h+=`<div class="section-title">Resultado final</div><div class="vbars">`+(v.opciones||[]).map(o=>{
+    const n=(v.conteo||{})[o.id]||0, pct=total?Math.round(n*100/total):0, wn=win&&win.id===o.id;
+    return `<div class="vbar ${wn?'win':''}"><div class="top"><span>${votEsc(o.texto)}</span><span class="n">${n} · ${pct}%</span></div><div class="track"><div class="fill" style="width:${pct}%"></div></div></div>`;
+  }).join('')+`</div>`;
+  h+=`<p class="vnote" style="margin:10px 2px">Votaron ${v.participaronCount} de ${v.totalCasas} casas.</p>`;
+  h+=`<div class="section-title">Casas que votaron</div><p class="vnote" style="margin:0 0 10px 2px">Esta lista muestra quiénes votaron, nunca qué votó cada quien.</p>`;
+  h+= nombres.length ? '<div class="list">'+nombres.map(p=>`<div class="row"><div class="rt"><div class="a">${votEsc(p.casa)}</div><div class="b">${votEsc(p.nombre)}</div></div></div>`).join('')+'</div>' : '<div class="empty">Sin participantes registrados.</div>';
+  $('#votHist').innerHTML=h;
+  $('#vActaBack').onclick=votCargarHistorial;
+}
+
+/* ---- Wiring (una sola vez, los elementos existen en index.html) ---- */
+$('#votSeg')?.addEventListener('click', e => { const b=e.target.closest('button'); if(b) votSwitchSeg(b.dataset.seg); });
+$('#vcAddOpt')?.addEventListener('click', votAddOptInput);
+$('#vcOpciones')?.addEventListener('click', e => { if (e.target.classList.contains('opt-del')){ const rows=$$('#vcOpciones .vc-optrow'); if (rows.length>2) e.target.closest('.vc-optrow').remove(); }});
+$('#vcGuardar')?.addEventListener('click', votGuardar);
+$('#votCrearOverlay')?.addEventListener('click', e => { if (e.target.id==='votCrearOverlay') closeSheet('#votCrearOverlay'); });
+$('#vcerrarConfirm')?.addEventListener('click', votCerrarConfirmar);
+$('#vcerrarCancel')?.addEventListener('click', () => closeSheet('#votCerrarOverlay'));
+$('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votCerrarOverlay') closeSheet('#votCerrarOverlay'); });
 
 /* ====================== Service worker (PWA) ====================== */
 if ('serviceWorker' in navigator){

@@ -80,6 +80,11 @@ export default {
         case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
         case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
         case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
+        case '/votaciones/crear':         out = await crearVotacion(req, env); break;
+        case '/votaciones/cerrar':        out = await cerrarVotacion(req, env); break;
+        case '/votaciones/votar':         out = await votarVotacion(req, env); break;
+        case '/votaciones/estado':        out = await estadoVotacion(req, env); break;
+        case '/votaciones/participacion': out = await participacionVotacion(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -1247,6 +1252,371 @@ async function triggerShelly(env, deviceId) {
    FIREBASE AUTH — verificación de ID token (JWKS)
    =========================================================== */
 let JWKS_CACHE = { keys:null, exp:0 };
+/* ===========================================================
+   VOTACIONES (FASE V2) — endpoints del Worker.
+   Garantías (ver el bloque votaciones/control de firestore.rules y el diseño aprobado):
+   - MASTER NO GESTIONA: crear/cerrar solo admin y jefe-admin (403 al master). No basta
+     esStaff() porque incluye al master; se excluye explícitamente con puedeGestionarVot().
+   - Solo el JEFE (con casa) vota; casaId se DERIVA del perfil verificado en Firestore.
+   - Un voto por casa: el id del doc participacion/{casaKey} es el candado (transacción).
+   - Anonimato: la liga casa->opción vive solo en _privado/voto__{casaKey} (read:false) y se
+     borra al congelar; participacion NO guarda opción; conteo es agregado.
+   - Bloque de 5 estricto: nunca se libera un bloque incompleto (ni al cerrar). Nombres en
+     orden aleatorio, sin orden ni timestamps. Candados (bloque + 1/hora) SOLO en el Worker.
+   - Hora de SERVIDOR (reloj del Worker) en todo; el dispositivo nunca decide.
+   =========================================================== */
+const HORA_MS = 3600 * 1000;
+const UMBRAL_MIN = 5;   // mínimo de participantes para mostrar el marcador
+const BLOQUE = 5;       // los nombres se liberan solo en bloques completos de 5
+
+// Gestionar (crear/cerrar) = admin puro o jefe-admin ACTIVO. NUNCA master. staff() no basta.
+function puedeGestionarVot(p) {
+  if (!p || p.rol === 'master') return false;
+  if (p.rol === 'admin') return true;
+  return p.esAdmin === true && (p.estado || 'activo') === 'activo';
+}
+// Jefe = residente sin jefeId y con casa. Admin puro / master / familiar => NO votan.
+function esJefePerfil(p) {
+  return !!p && p.rol === 'residente' && !p.jefeId && !!(p.casa && String(p.casa).trim());
+}
+// Clave de doc estable y URL-safe por casa: hash del domicilio normalizado (sin espacios/acentos).
+async function casaKeyDe(domicilio) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normDomicilio(domicilio)));
+  return [...new Uint8Array(buf)].slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function docName(env, path) { return `projects/${env.FIREBASE_PROJECT}/databases/(default)/documents/${path}`; }
+function mapaInts(obj) { const fields = {}; for (const [k, v] of Object.entries(obj)) fields[k] = { integerValue: String(v) }; return { mapValue: { fields } }; }
+function arrOpciones(ops) { return { arrayValue: { values: ops.map(o => ({ mapValue: { fields: { id: { stringValue: o.id }, texto: { stringValue: o.texto } } } })) } }; }
+function barajar(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+// GET simple (sin transacción). Devuelve el doc crudo {name,fields} o null.
+async function getDoc(env, at, path) {
+  const r = await fetch(`${fsBase(env)}/${path}`, { headers: { Authorization: 'Bearer ' + at } });
+  if (r.status === 404) return null;
+  if (!r.ok) throw httpErr(500, 'Firestore get falló');
+  return r.json();
+}
+// Firestore -> objeto de votación, incluyendo opciones (array) y conteo (map), que readDoc no maneja.
+function parseVotacion(doc) {
+  if (!doc || !doc.fields) return null;
+  const f = doc.fields;
+  const base = readDoc(f) || {};
+  base.opciones = (f.opciones?.arrayValue?.values || []).map(v => ({
+    id: v.mapValue?.fields?.id?.stringValue, texto: v.mapValue?.fields?.texto?.stringValue,
+  }));
+  const cf = f.conteo?.mapValue?.fields;
+  base.conteo = cf ? Object.fromEntries(Object.entries(cf).map(([k, v]) => [k, +(v.integerValue || 0)])) : null;
+  base.id = doc.name.split('/').pop();
+  return base;
+}
+
+// ---- transacción read-modify-write serializable (para doble voto y "una sola activa") ----
+async function txBegin(env, at) {
+  const r = await fetch(`${fsBase(env)}:beginTransaction`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ options: { readWrite: {} } }),
+  });
+  if (!r.ok) throw httpErr(500, 'No se pudo iniciar la transacción');
+  return (await r.json()).transaction;
+}
+async function txGet(env, at, path, tx) {
+  const r = await fetch(`${fsBase(env)}/${path}?transaction=${encodeURIComponent(tx)}`, { headers: { Authorization: 'Bearer ' + at } });
+  if (r.status === 404) return null;
+  if (!r.ok) throw httpErr(500, 'Firestore read (tx) falló');
+  const d = await r.json();
+  return d.fields ? d : null;
+}
+async function txCommit(env, at, tx, writes) {
+  const r = await fetch(`${fsBase(env)}:commit`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transaction: tx, writes }),
+  });
+  return r.ok;   // false => conflicto (ABORTED): el caller reintenta
+}
+// Ejecuta fn(at, tx) -> { writes, value }; commitea con reintentos ante conflicto de concurrencia.
+async function conTx(env, fn, tries = 4) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  for (let i = 0; i < tries; i++) {
+    const tx = await txBegin(env, at);
+    let out;
+    try {
+      out = await fn(at, tx);
+    } catch (e) {
+      await fetch(`${fsBase(env)}:rollback`, {
+        method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transaction: tx }),
+      }).catch(() => {});
+      throw e;   // error de negocio (403/409): no reintentar, propagar
+    }
+    if (await txCommit(env, at, tx, out.writes || [])) return out.value;
+  }
+  throw httpErr(409, 'Conflicto de concurrencia, reintenta');
+}
+
+// # de casas (jefes) activas del padrón — mismo criterio que /personas/listar.
+async function contarCasasActivas(env, at) {
+  const all = await personasList(env, at);
+  return all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
+}
+// Borra la liga privada. soloVotos=true: solo voto__* (al congelar, conservando tally y throttles).
+// soloVotos=false: TODO _privado (al cerrar). Best-effort, fuera de transacción.
+async function borrarPrivado(env, at, votacionId, soloVotos) {
+  let docs = [];
+  try { docs = await firestoreList(env, `votaciones/${votacionId}/_privado`); } catch { return; }
+  for (const d of docs) {
+    const id = d.name.split('/').pop();
+    if (soloVotos && !id.startsWith('voto__')) continue;
+    await fetch(`${fsBase(env)}/votaciones/${votacionId}/_privado/${id}`, {
+      method: 'DELETE', headers: { Authorization: 'Bearer ' + at },
+    }).catch(() => {});
+  }
+}
+// Reconciliación PEREZOSA del congelamiento (sin cron): en la 1a llamada tras congelaAt marca
+// 'congelada' y BORRA la liga votante->opción. La liga es ilegible por cliente (read:false);
+// solo la vería quien tenga la SA, y esta ventana la cierra el borrado. cerrar() borra el resto.
+async function reconciliarFreeze(env, at, vot) {
+  if (vot && vot.estado === 'abierta' && vot.congelaAt && Date.now() >= Date.parse(vot.congelaAt)) {
+    await firestoreUpdate(env, `votaciones/${vot.id}`, { estado: { stringValue: 'congelada' } }, ['estado']);
+    await borrarPrivado(env, at, vot.id, /* soloVotos */ true);
+    vot.estado = 'congelada';
+  }
+  return vot;
+}
+
+/* ---- POST /votaciones/crear — admin o jefe-admin (403 al master) ---- */
+async function crearVotacion(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!puedeGestionarVot(perfil)) throw httpErr(403, 'Solo un administrador puede crear votaciones');
+
+  const body = await req.json();
+  const titulo = String(body.titulo || '').trim();
+  const descripcion = String(body.descripcion || '').trim();
+  if (titulo.length < 3) throw httpErr(400, 'El título es muy corto');
+  const textos = Array.isArray(body.opciones) ? body.opciones.map(s => String(s || '').trim()).filter(Boolean) : [];
+  if (textos.length < 2 || textos.length > 10) throw httpErr(400, 'Se requieren entre 2 y 10 opciones');
+  const cierra = Date.parse(body.cierraAt);
+  if (!Number.isFinite(cierra)) throw httpErr(400, 'Fecha de cierre inválida');
+  const ahora = Date.now();
+  // Debe haber ventana de congelamiento: el cierre a más de 24h en el futuro (si no, congelaAt < ahora).
+  if (cierra - ahora <= 24 * HORA_MS) throw httpErr(400, 'El cierre debe ser a más de 24h en el futuro (para la ventana de congelamiento)');
+  const congela = cierra - 24 * HORA_MS;
+  const umbral = Math.max(UMBRAL_MIN, +body.umbralConteo || UMBRAL_MIN);
+  const opciones = textos.map((t, i) => ({ id: `op${i + 1}`, texto: t }));
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const totalCasas = await contarCasasActivas(env, at);
+  const id = crypto.randomUUID();
+
+  const votacionId = await conTx(env, async (atx, tx) => {
+    const ctrl = await txGet(env, atx, 'control/votaciones', tx);
+    const activaId = ctrl?.fields?.activaId?.stringValue || null;
+    if (activaId) {
+      const vdoc = await txGet(env, atx, `votaciones/${activaId}`, tx);
+      const estado = vdoc?.fields?.estado?.stringValue;
+      if (estado === 'abierta' || estado === 'congelada') throw httpErr(409, 'Ya hay una votación activa');
+    }
+    const fields = {
+      titulo: { stringValue: titulo }, descripcion: { stringValue: descripcion },
+      opciones: arrOpciones(opciones),
+      estado: { stringValue: 'abierta' }, activa: { booleanValue: true },
+      creadaPor: { stringValue: user.uid },
+      createdAt: { timestampValue: new Date(ahora).toISOString() },
+      cierraAt: { timestampValue: new Date(cierra).toISOString() },
+      congelaAt: { timestampValue: new Date(congela).toISOString() },
+      totalCasasSnapshot: { integerValue: String(totalCasas) },
+      umbralConteo: { integerValue: String(umbral) },
+      participaronCount: { integerValue: '0' },
+      // sin campo "conteo" hasta que participaronCount >= umbral (umbral aplicado en datos)
+    };
+    return {
+      writes: [
+        { update: { name: docName(env, `votaciones/${id}`), fields }, currentDocument: { exists: false } },
+        { update: { name: docName(env, 'control/votaciones'), fields: { activaId: { stringValue: id } } }, updateMask: { fieldPaths: ['activaId'] } },
+      ],
+      value: id,
+    };
+  });
+  return json({ ok: true, votacionId });
+}
+
+/* ---- POST /votaciones/cerrar — admin o jefe-admin (403 al master) ---- */
+async function cerrarVotacion(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!puedeGestionarVot(perfil)) throw httpErr(403, 'Solo un administrador puede cerrar votaciones');
+  const { votacionId } = await req.json();
+  if (!votacionId || typeof votacionId !== 'string') throw httpErr(400, 'Falta votacionId');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const vot = parseVotacion(await getDoc(env, at, `votaciones/${votacionId}`));
+  if (!vot) throw httpErr(404, 'Votación no encontrada');
+  if (vot.estado === 'cerrada') throw httpErr(409, 'La votación ya está cerrada');
+
+  // 1) marca cerrada + libera el puntero de "activa" en un commit atómico.
+  await conTx(env, async () => ({
+    writes: [
+      { update: { name: docName(env, `votaciones/${votacionId}`), fields: { estado: { stringValue: 'cerrada' }, activa: { booleanValue: false } } }, updateMask: { fieldPaths: ['estado', 'activa'] } },
+      { update: { name: docName(env, 'control/votaciones'), fields: { activaId: { nullValue: null } } }, updateMask: { fieldPaths: ['activaId'] } },
+    ],
+  }));
+  // 2) borra TODO _privado (votos + throttles). El conteo público ya quedó congelado en el doc.
+  await borrarPrivado(env, at, votacionId, /* soloVotos */ false);
+
+  return json({ ok: true, votacionId, conteoFinal: vot.conteo, participaronCount: vot.participaronCount || 0 });
+}
+
+/* ---- POST /votaciones/votar — SOLO el jefe con casa (emitir o cambiar) ---- */
+async function votarVotacion(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esJefePerfil(perfil)) throw httpErr(403, 'Solo el jefe de una casa puede votar');
+  if (perfil.suspendido || (perfil.estado || 'activo') !== 'activo') throw httpErr(403, 'La casa está suspendida');
+  const { opcion } = await req.json();
+  if (!opcion || typeof opcion !== 'string') throw httpErr(400, 'Falta la opción');
+
+  const casaKey = await casaKeyDe(perfil.casa);
+  const casaDisplay = String(perfil.casa).trim().replace(/\s+/g, ' ');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+
+  const ctrl = await getDoc(env, at, 'control/votaciones');
+  const activaId = ctrl?.fields?.activaId?.stringValue || null;
+  if (!activaId) throw httpErr(409, 'No hay una votación activa');
+  let vot = parseVotacion(await getDoc(env, at, `votaciones/${activaId}`));
+  if (!vot) throw httpErr(409, 'No hay una votación activa');
+  vot = await reconciliarFreeze(env, at, vot);   // congela + borra liga si ya pasó congelaAt
+
+  const ahora = Date.now();
+  if (vot.estado === 'cerrada' || ahora >= Date.parse(vot.cierraAt)) throw httpErr(409, 'La votación está cerrada');
+  if (!vot.opciones.some(o => o.id === opcion)) throw httpErr(400, 'Opción inválida');
+  const congelado = ahora >= Date.parse(vot.congelaAt);
+
+  const value = await conTx(env, async (atx, tx) => {
+    const part = await txGet(env, atx, `votaciones/${activaId}/participacion/${casaKey}`, tx);
+    const votDoc = await txGet(env, atx, `votaciones/${activaId}`, tx);
+    const tallyDoc = await txGet(env, atx, `votaciones/${activaId}/_privado/tally`, tx);
+    const participaron = +(votDoc?.fields?.participaronCount?.integerValue || 0);
+    const umbral = +(votDoc?.fields?.umbralConteo?.integerValue || UMBRAL_MIN);
+    const tally = {};
+    const tf = tallyDoc?.fields?.conteo?.mapValue?.fields;
+    if (tf) for (const [k, v] of Object.entries(tf)) tally[k] = +(v.integerValue || 0);
+
+    const writes = [];
+    let nuevoParticiparon = participaron;
+
+    if (part) {
+      // CAMBIO — bloqueado si ya se congeló.
+      if (congelado) throw httpErr(409, 'El voto ya está congelado: a 24h del cierre no se puede cambiar');
+      const votoPrev = await txGet(env, atx, `votaciones/${activaId}/_privado/voto__${casaKey}`, tx);
+      const prev = votoPrev?.fields?.opcionActual?.stringValue;
+      if (prev && prev !== opcion) {
+        tally[prev] = Math.max(0, (tally[prev] || 0) - 1);
+        tally[opcion] = (tally[opcion] || 0) + 1;
+      }
+      writes.push({ update: { name: docName(env, `votaciones/${activaId}/_privado/voto__${casaKey}`), fields: { opcionActual: { stringValue: opcion } } }, updateMask: { fieldPaths: ['opcionActual'] } });
+    } else {
+      // PRIMERA VEZ — el id del doc participacion/{casaKey} es el candado anti-doble-voto.
+      nuevoParticiparon = participaron + 1;
+      tally[opcion] = (tally[opcion] || 0) + 1;
+      writes.push({ update: { name: docName(env, `votaciones/${activaId}/participacion/${casaKey}`), fields: { orden: { integerValue: String(nuevoParticiparon) }, nombre: { stringValue: perfil.nombre || '' }, casa: { stringValue: casaDisplay } } }, currentDocument: { exists: false } });
+      // liga privada SOLO mientras se pueda cambiar (pre-freeze); post-freeze no se guarda liga alguna.
+      if (!congelado) writes.push({ update: { name: docName(env, `votaciones/${activaId}/_privado/voto__${casaKey}`), fields: { opcionActual: { stringValue: opcion } } } });
+    }
+    // tally interno (Worker-only) siempre al día.
+    writes.push({ update: { name: docName(env, `votaciones/${activaId}/_privado/tally`), fields: { conteo: mapaInts(tally) } }, updateMask: { fieldPaths: ['conteo'] } });
+    // doc público: participaronCount + espejo de conteo SOLO si se alcanzó el umbral.
+    const votUpdate = { participaronCount: { integerValue: String(nuevoParticiparon) } };
+    const mask = ['participaronCount'];
+    if (nuevoParticiparon >= umbral) { votUpdate.conteo = mapaInts(tally); mask.push('conteo'); }
+    writes.push({ update: { name: docName(env, `votaciones/${activaId}`), fields: votUpdate }, updateMask: { fieldPaths: mask } });
+
+    return { writes, value: { yaVotaste: true, miOpcionActual: opcion, puedeCambiar: !congelado } };
+  });
+  return json({ ok: true, ...value });
+}
+
+/* ---- POST /votaciones/estado — cualquier vecino: marcador en vivo + si YO ya voté ---- */
+async function estadoVotacion(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+
+  const ctrl = await getDoc(env, at, 'control/votaciones');
+  const activaId = ctrl?.fields?.activaId?.stringValue || null;
+  if (!activaId) return json({ activa: null });
+  let vot = parseVotacion(await getDoc(env, at, `votaciones/${activaId}`));
+  if (!vot) return json({ activa: null });
+  vot = await reconciliarFreeze(env, at, vot);
+
+  const ahora = Date.now();
+  const cerrada = vot.estado === 'cerrada' || ahora >= Date.parse(vot.cierraAt);
+  const congelado = ahora >= Date.parse(vot.congelaAt);
+
+  const resp = {
+    activa: {
+      id: vot.id, titulo: vot.titulo, descripcion: vot.descripcion, opciones: vot.opciones,
+      estado: cerrada ? 'cerrada' : (congelado ? 'congelada' : 'abierta'),
+      cierraAt: vot.cierraAt, congelaAt: vot.congelaAt,
+      participaronCount: vot.participaronCount || 0, totalCasas: vot.totalCasasSnapshot || 0,
+      umbralConteo: vot.umbralConteo || UMBRAL_MIN,
+      conteo: vot.conteo || null,          // solo presente si participaronCount >= umbral
+      conteoOculto: !vot.conteo,
+    },
+  };
+  // Vista PERSONAL del jefe (solo su propia casa). Nadie ve la opción de nadie más.
+  if (esJefePerfil(perfil)) {
+    const casaKey = await casaKeyDe(perfil.casa);
+    const part = await getDoc(env, at, `votaciones/${activaId}/participacion/${casaKey}`);
+    const yaVotaste = !!part;
+    let miOpcionActual = null;
+    if (yaVotaste && !congelado) {
+      const voto = await getDoc(env, at, `votaciones/${activaId}/_privado/voto__${casaKey}`);
+      miOpcionActual = voto?.fields?.opcionActual?.stringValue || null;
+    }
+    resp.yo = { esJefe: true, yaVotaste, miOpcionActual, puedeCambiar: yaVotaste && !congelado && !cerrada };
+  } else {
+    resp.yo = { esJefe: false };   // admin puro / master / familiar no votan
+  }
+  return json(resp);
+}
+
+/* ---- POST /votaciones/participacion — lista nominal, con los DOS candados en el Worker ----
+   Lectura permitida a staff (master incluido: master LEE todo, no gestiona). Jefe/familiar => 403.
+   Candado 1: bloque de 5 estricto (nunca un bloque incompleto). Candado 2: 1 consulta/hora por
+   cuenta, con hora de servidor. Ambos aquí; manipular el front no los burla (recibe 403). */
+async function participacionVotacion(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo el staff consulta la lista de participación');
+  const { votacionId } = await req.json();
+  if (!votacionId || typeof votacionId !== 'string') throw httpErr(400, 'Falta votacionId');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+
+  // Candado 2 — 1/hora por cuenta (hora de servidor), bucket independiente por uid.
+  const accPath = `votaciones/${votacionId}/_privado/admin__${user.uid}`;
+  const acc = await getDoc(env, at, accPath);
+  const ultimo = acc?.fields?.ultimoAccesoAt?.timestampValue ? Date.parse(acc.fields.ultimoAccesoAt.timestampValue) : 0;
+  if (Date.now() - ultimo < HORA_MS) throw httpErr(403, 'Solo puedes consultar la lista una vez por hora');
+  await firestoreSet(env, accPath, { ultimoAccesoAt: { timestampValue: new Date().toISOString() } }, at);
+
+  const vot = parseVotacion(await getDoc(env, at, `votaciones/${votacionId}`));
+  if (!vot) throw httpErr(404, 'Votación no encontrada');
+  const participaron = vot.participaronCount || 0;
+  // Candado 1 — bloque de 5 estricto: solo bloques COMPLETOS, nunca el remanente (ni al cerrar).
+  const reveladosCount = Math.floor(participaron / BLOQUE) * BLOQUE;
+
+  let nombres = [];
+  if (reveladosCount > 0) {
+    const docs = await firestoreList(env, `votaciones/${votacionId}/participacion`);
+    nombres = docs.map(d => readDoc(d.fields))
+      .filter(p => (p.orden || 0) <= reveladosCount)
+      .map(p => ({ nombre: p.nombre || '', casa: p.casa || '' }));   // sin orden, sin timestamps
+    barajar(nombres);   // orden aleatorio dentro del bloque
+  }
+  return json({ ok: true, participaronCount: participaron, reveladosCount, pendientesSinDesglosar: participaron - reveladosCount, nombres });
+}
+
 async function requireAuth(req, env) {
   const h = req.headers.get('Authorization') || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;

@@ -85,6 +85,8 @@ export default {
         case '/votaciones/votar':         out = await votarVotacion(req, env); break;
         case '/votaciones/estado':        out = await estadoVotacion(req, env); break;
         case '/votaciones/participacion': out = await participacionVotacion(req, env); break;
+        case '/votaciones/historial':     out = await historialVotaciones(req, env); break;
+        case '/votaciones/participantes':  out = await participantesVotacion(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -1453,17 +1455,69 @@ async function cerrarVotacion(req, env) {
   if (!vot) throw httpErr(404, 'Votación no encontrada');
   if (vot.estado === 'cerrada') throw httpErr(409, 'La votación ya está cerrada');
 
-  // 1) marca cerrada + libera el puntero de "activa" en un commit atómico.
+  // FASE V2.5 — al cerrar, la votación queda como ACTA permanente. Fijamos el conteo final
+  // desde _privado/tally (necesario si tuvo <umbral votos y el conteo público nunca se
+  // publicó) y en el MISMO commit borramos TODO _privado, para que el acta jamás conserve
+  // la liga votante->opción. Snapshot del AGREGADO (tally), nunca de voto__*.
+  const privados = await firestoreList(env, `votaciones/${votacionId}/_privado`).catch(() => []);
+  const tally = {};
+  const tf = privados.find(d => d.name.endsWith('/tally'))?.fields?.conteo?.mapValue?.fields;
+  if (tf) for (const [k, v] of Object.entries(tf)) tally[k] = +(v.integerValue || 0);
+
   await conTx(env, async () => ({
     writes: [
-      { update: { name: docName(env, `votaciones/${votacionId}`), fields: { estado: { stringValue: 'cerrada' }, activa: { booleanValue: false } } }, updateMask: { fieldPaths: ['estado', 'activa'] } },
+      { update: { name: docName(env, `votaciones/${votacionId}`), fields: {
+          estado: { stringValue: 'cerrada' }, activa: { booleanValue: false },
+          conteo: mapaInts(tally),
+          cerradaAt: { timestampValue: new Date().toISOString() },
+          cerradaPor: { stringValue: user.uid },
+        } }, updateMask: { fieldPaths: ['estado', 'activa', 'conteo', 'cerradaAt', 'cerradaPor'] } },
       { update: { name: docName(env, 'control/votaciones'), fields: { activaId: { nullValue: null } } }, updateMask: { fieldPaths: ['activaId'] } },
+      ...privados.map(d => ({ delete: docName(env, `votaciones/${votacionId}/_privado/${d.name.split('/').pop()}`) })),
     ],
   }));
-  // 2) borra TODO _privado (votos + throttles). El conteo público ya quedó congelado en el doc.
-  await borrarPrivado(env, at, votacionId, /* soloVotos */ false);
 
-  return json({ ok: true, votacionId, conteoFinal: vot.conteo, participaronCount: vot.participaronCount || 0 });
+  // Defensa: ya cerrada, votar() rechaza nuevos votos, así que no aparecen más ligas. Si una se
+  // coló entre el list y el commit, su voto__* no estaba en la lista borrada -> se limpia aquí,
+  // de forma terminal. El acta NO se considera completa mientras _privado no quede VACÍO.
+  let resto = await firestoreList(env, `votaciones/${votacionId}/_privado`).catch(() => []);
+  for (let i = 0; i < 3 && resto.length; i++) { await borrarPrivado(env, at, votacionId, false); resto = await firestoreList(env, `votaciones/${votacionId}/_privado`).catch(() => []); }
+  if (resto.length) throw httpErr(500, 'No se pudo limpiar la liga privada al archivar');
+
+  return json({ ok: true, votacionId, conteoFinal: tally, participaronCount: vot.participaronCount || 0 });
+}
+
+/* ---- POST /votaciones/historial — lista de votaciones CERRADAS (actas). Cualquier residente ----
+   Solo el agregado + metadata; los nombres van en /votaciones/participantes. */
+async function historialVotaciones(req, env) {
+  await requireAuth(req, env);   // cualquier residente autenticado; sin sesión -> 401
+  const docs = await firestoreList(env, 'votaciones');
+  const cerradas = docs.map(parseVotacion).filter(v => v && v.estado === 'cerrada');
+  cerradas.sort((a, b) => Date.parse(b.cerradaAt || b.cierraAt || 0) - Date.parse(a.cerradaAt || a.cierraAt || 0));
+  const votaciones = cerradas.map(v => ({
+    id: v.id, titulo: v.titulo, descripcion: v.descripcion, opciones: v.opciones,
+    conteo: v.conteo || {}, participaronCount: v.participaronCount || 0,
+    totalCasas: v.totalCasasSnapshot || 0, cerradaAt: v.cerradaAt || null, cierraAt: v.cierraAt || null,
+  }));
+  return json({ ok: true, votaciones });
+}
+
+/* ---- POST /votaciones/participantes — lista COMPLETA de una votación CERRADA. Cualquier residente ----
+   Sin bloque de 5 ni throttle: la liga ya no existe y el marcador ya no se mueve, así que el
+   bloque no protegería nada (es el acta). Sobre una votación ABIERTA -> 409 (usa /participacion). */
+async function participantesVotacion(req, env) {
+  await requireAuth(req, env);   // cualquier residente autenticado; sin sesión -> 401
+  const { votacionId } = await req.json();
+  if (!votacionId || typeof votacionId !== 'string') throw httpErr(400, 'Falta votacionId');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const vot = parseVotacion(await getDoc(env, at, `votaciones/${votacionId}`));
+  if (!vot) throw httpErr(404, 'Votación no encontrada');
+  if (vot.estado !== 'cerrada') throw httpErr(409, 'La lista completa solo está disponible en el historial (votaciones cerradas)');
+
+  const docs = await firestoreList(env, `votaciones/${votacionId}/participacion`);
+  const nombres = docs.map(d => readDoc(d.fields)).map(p => ({ nombre: p.nombre || '', casa: p.casa || '' }));
+  nombres.sort((a, b) => (a.casa || '').localeCompare(b.casa || '', 'es', { numeric: true }));   // orden legible por casa (anonimato ya no depende del orden)
+  return json({ ok: true, votacionId, titulo: vot.titulo, conteo: vot.conteo || {}, participaronCount: vot.participaronCount || 0, totalCasas: vot.totalCasasSnapshot || 0, nombres });
 }
 
 /* ---- POST /votaciones/votar — SOLO el jefe con casa (emitir o cambiar) ---- */

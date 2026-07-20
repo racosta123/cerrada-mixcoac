@@ -722,13 +722,16 @@ function renderMiFamilia(max, puedeInvitar){
       + `<div class="rt"><div class="a">${esc(f.nombre)}</div>${f.telefono?`<div class="b">${esc(f.telefono)}</div>`:''}</div>`
       + `<div class="tags">${tagEstado}${tagCuenta}</div>`;
     list.appendChild(row);
-    // Cancelar: solo mientras el familiar siga "Sin cuenta" (aún no se registró).
+    // Sin cuenta: puede REENVIAR el link (emite uno nuevo) o CANCELAR al familiar.
     if (!f.registrado){
       const wrap = document.createElement('div'); wrap.className = 'persona-acts';
+      const r = document.createElement('button');
+      r.className = 'row-act'; r.textContent = 'Reenviar';
+      r.addEventListener('click', () => reenviarFamiliar(f, r));
       const c = document.createElement('button');
       c.className = 'row-act danger'; c.textContent = 'Cancelar';
       c.addEventListener('click', () => abrirFamiliarCancel(f));
-      wrap.appendChild(c); list.appendChild(wrap);
+      wrap.appendChild(r); wrap.appendChild(c); list.appendChild(wrap);
     }
   });
 }
@@ -756,6 +759,21 @@ $('#saveFamiliarBtn')?.addEventListener('click', async () => {
     $('#faErr').textContent = e.message || 'No se pudo generar la invitación';
   } finally { btn.disabled = false; btn.textContent = 'Generar invitación'; }
 });
+
+/* Reenviar: re-emite el link de un familiar "Sin cuenta" (el jefe perdió el mensaje). El
+   Worker emite un token nuevo e invalida el anterior; mismas validaciones que invitar. */
+async function reenviarFamiliar(f, btn){
+  const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/invitaciones/familiar-reenviar', { id: f.id });
+    toast('Link nuevo generado. El anterior ya no sirve.', 'ok');
+    const url = new URL('registro.html', location.href).href + '#' + r.token;
+    const texto = `Hola ${f.nombre}, te invito a registrarte en la app de Cerrada Mixcoac como parte de mi familia. Abre este enlace (vence en 72 h):`;
+    await compartirInvitacion({ title:'Cerrada Mixcoac', text: texto, url }, { titulo: f.nombre, sub:'Familiar' });
+  } catch(e){
+    toast(e.message || 'No se pudo reenviar la invitación', 'bad');
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
 
 let familiarCancelId = null;
 function abrirFamiliarCancel(f){

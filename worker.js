@@ -80,6 +80,7 @@ export default {
         case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
         case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
         case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
+        case '/invitaciones/familiar-reenviar': out = await reenviarInvitacionFamiliar(req, env); break;
         case '/votaciones/crear':         out = await crearVotacion(req, env); break;
         case '/votaciones/cerrar':        out = await cerrarVotacion(req, env); break;
         case '/votaciones/votar':         out = await votarVotacion(req, env); break;
@@ -693,6 +694,30 @@ async function crearInvitacionFamiliar(req, env) {
   byId[fid] = persona;
   const t = await emitirInvitacion(env, at, { persona, byId, creadoPor: user.uid });
   return json({ ok:true, familiarId: fid, token: t.token, expiraEn: t.expiraEn });
+}
+
+/* /invitaciones/familiar-reenviar — el JEFE re-emite el link de un familiar suyo que sigue
+   "Sin cuenta" (perdió el mensaje). NO crea persona ni cuenta contra el tope de 5: solo emite
+   un token nuevo (emitirInvitacion invalida el previo). Mismas validaciones que crear: solo el
+   jefe DUEÑO, jefe suspendido NO puede, y no se reenvía a alguien ya registrado. */
+async function reenviarInvitacionFamiliar(req, env) {
+  const user = await requireAuth(req, env);
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const jefe = all.find(p => p.uid === user.uid);
+  if (!jefe) throw httpErr(403, 'Sin perfil');
+  if (!esJefe(jefe)) throw httpErr(403, 'Solo un jefe de familia puede reenviar invitaciones');
+  if ((jefe.estado || 'activo') !== 'activo') throw httpErr(403, 'Tu cuenta está suspendida; no puedes invitar');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const fam = byId[id];
+  if (!fam || fam.jefeId !== jefe.id) throw httpErr(404, 'Ese familiar no es tuyo');
+  if (fam.uid) throw httpErr(409, 'Ese familiar ya tiene cuenta');
+
+  const t = await emitirInvitacion(env, at, { persona: fam, byId, creadoPor: user.uid });
+  return json({ ok:true, familiarId: fam.id, token: t.token, expiraEn: t.expiraEn });
 }
 
 /* Emite un token de un uso para una persona: invalida los previos no usados de esa persona

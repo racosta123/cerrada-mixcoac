@@ -1018,7 +1018,7 @@ async function borrarPersona(req, env) {
 
   const { id } = await req.json();
   if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
-  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/identitytoolkit https://www.googleapis.com/auth/datastore');
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
@@ -1033,6 +1033,22 @@ async function borrarPersona(req, env) {
     }
   }
 
+  // 1) Borra la cuenta de Firebase Auth PRIMERO. Si falla (y no es USER_NOT_FOUND), aborta
+  //    ANTES de tocar Firestore: nada se respalda ni se borra, la persona queda intacta en el
+  //    padrón y no se registra en bitácora — así no quedan estados a medias (persona sin cuenta
+  //    o cuenta sin persona). El token pide scope identitytoolkit (ver arriba) para poder borrar.
+  if (p.uid) {
+    const rDel = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts:delete`, {
+      method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+      body: JSON.stringify({ localId: p.uid }),
+    });
+    if (!rDel.ok) {
+      const err = await rDel.json().catch(() => ({}));
+      if (!String(err.error?.message || '').includes('USER_NOT_FOUND')) throw httpErr(500, 'No se pudo borrar la cuenta de Auth');
+    }
+  }
+
+  // 2) Con Auth ya resuelto, respalda el doc y borra en Firestore.
   const rGet = await fetch(`${fsBase(env)}/personas/${id}`, { headers:{ Authorization:'Bearer '+at } });
   const doc = rGet.ok ? await rGet.json() : null;
   await firestoreSet(env, `personas_borradas/${id}`, {
@@ -1041,9 +1057,6 @@ async function borrarPersona(req, env) {
   }, at);
 
   if (p.uid) {
-    await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts:delete`, {
-      method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' }, body: JSON.stringify({ localId: p.uid }),
-    }).catch(() => {});
     await fetch(`${fsBase(env)}/usuarios/${p.uid}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
   }
   for (const iv of (await firestoreList(env, 'registro_invitaciones')).filter(d => { const x = readDoc(d.fields); return x.personaId === id && !x.usado; })) {
